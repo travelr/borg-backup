@@ -8,7 +8,7 @@
 # - docker compose v2: Required for container operations
 #
 # USAGE:
-#   $0 [--dry-run | --check-only | --no-prune | --repo-check | --help]
+#   $0 [--dry-run | --check-only | --no-prune | --repo-check | --check-sqlite | --help]
 #
 # SECURITY NOTES:
 # - Sensitive credentials must be in /root/borg-backup.env with 600 permissions and owned by root
@@ -196,115 +196,6 @@ check_lock_pid() {
     fi
 }
 
-# Function to find all services that depend on database services (including transitive dependencies)
-find_all_dependent_services() {
-    local target_services=("$@")
-    local all_deps=()
-    local processed=()
-    local iteration_count=0
-    
-    # Get compose configuration as JSON with proper error handling
-    local compose_config_json
-    if ! compose_config_json=$("${DOCKER_COMPOSE_CMD[@]}" -f "$DOCKER_COMPOSE_FILE" config --format json 2>/dev/null); then
-        error_exit "Failed to get compose configuration as JSON from $DOCKER_COMPOSE_FILE"
-    fi
-    
-    while [ ${#target_services[@]} -gt 0 ]; do
-        # Safety check to prevent infinite loops
-        if [ $iteration_count -gt $MAX_DEPENDENCY_ITERATIONS ]; then
-            error_exit "find_all_dependent_services: Exceeded maximum iterations ($MAX_DEPENDENCY_ITERATIONS), possible circular dependency or extremely deep chain."
-        fi
-        iteration_count=$((iteration_count + 1))
-        
-        local current=${target_services[0]}
-        target_services=("${target_services[@]:1}")
-        
-        if [[ " ${processed[@]} " =~ " $current " ]]; then
-            continue
-        fi
-        
-        processed+=("$current")
-        
-        # Find services that depend on current service
-        local deps
-        deps=$(echo "$compose_config_json" | jq -r --arg svc "$current" '
-            .services | to_entries[] | select(
-                (.value.depends_on | type == "object" and has($svc)) or
-                (.value.depends_on | type == "array" and index($svc))
-            ) | .key
-        ')
-        
-        # Check if jq command succeeded
-        if [ $? -ne 0 ]; then
-            error_exit "Failed to parse compose configuration JSON for dependencies of $current using jq."
-        fi
-        
-        while IFS= read -r dep; do
-            if [ -n "$dep" ] && [[ ! " ${all_deps[@]} " =~ " $dep " ]]; then
-                all_deps+=("$dep")
-                target_services+=("$dep")
-            fi
-        done <<< "$deps"
-    done
-    
-    printf '%s\n' "${all_deps[@]}"
-}
-
-# Function to find services depending on database services
-find_dependent_services() {
-    log "Discovering services dependent on database services..."
-    local db_services=()
-    local mariadb_cid; mariadb_cid=$("${DOCKER_COMPOSE_CMD[@]}" -f "$DOCKER_COMPOSE_FILE" ps -q mariadb 2>/dev/null || true)
-    local postgres_cid; postgres_cid=$("${DOCKER_COMPOSE_CMD[@]}" -f "$DOCKER_COMPOSE_FILE" ps -q postgres 2>/dev/null || true)
-
-    # Determine which DB services exist
-    if [ -n "$mariadb_cid" ]; then
-        db_services+=("mariadb")
-    fi
-    if [ -n "$postgres_cid" ]; then
-        db_services+=("postgres")
-    fi
-
-    if [ ${#db_services[@]} -eq 0 ]; then
-        log "No database services (mariadb, postgres) found in compose file. No dependent services to identify."
-        return 0
-    fi
-
-    log "Found database services: ${db_services[*]}"
-
-    # Get compose configuration as JSON with proper error handling
-    local compose_config_json
-    if ! compose_config_json=$("${DOCKER_COMPOSE_CMD[@]}" -f "$DOCKER_COMPOSE_FILE" config --format json 2>/dev/null); then
-        error_exit "Failed to get compose configuration as JSON from $DOCKER_COMPOSE_FILE"
-    fi
-
-    # Add database services themselves to the list of services to stop
-    for db_service in "${db_services[@]}"; do
-        if [[ ! " ${SERVICES_TO_STOP[@]} " =~ " $db_service " ]]; then
-            SERVICES_TO_STOP+=("$db_service")
-            log "Added database service to stop list: $db_service"
-        fi
-    done
-
-    # Find all services that depend on the database services (including transitive dependencies)
-    local all_deps
-    all_deps=$(find_all_dependent_services "${db_services[@]}")
-    
-    # Use associative array for efficient deduplication
-    local -A seen_services
-    while IFS= read -r service; do
-        if [ -n "$service" ] && [ -z "${seen_services[$service]+isset}" ]; then
-            if [[ ! " ${SERVICES_TO_STOP[@]} " =~ " $service " ]]; then
-                SERVICES_TO_STOP+=("$service")
-                seen_services["$service"]=1
-                log "Identified dependent service: $service"
-            fi
-        fi
-    done <<< "$all_deps"
-
-    log "Services identified for stop/start during backup: ${SERVICES_TO_STOP[*]}"
-}
-
 ################################################################################
 # SCRIPT INITIALIZATION
 ################################################################################
@@ -375,12 +266,13 @@ fi
 
 show_help() {
     echo "Enterprise-Grade Borg Backup Script"
-    echo "Usage: $0 [--dry-run | --check-only | --no-prune | --repo-check | --help]"
-    echo "  --dry-run    Simulate all operations without making changes."
-    echo "  --check-only Run pre-flight checks only, then exit."
-    echo "  --no-prune   Skip pruning old archives."
-    echo "  --repo-check Run repository integrity check."
-    echo "  --help       Display this help message."
+    echo "Usage: $0 [--dry-run | --check-only | --no-prune | --repo-check | --check-sqlite | --help]"
+    echo "  --dry-run      Simulate all operations without making changes."
+    echo "  --check-only   Run pre-flight checks only, then exit."
+    echo "  --no-prune     Skip pruning old archives."
+    echo "  --repo-check   Run repository integrity check."
+    echo "  --check-sqlite Run application-level integrity check on backed up SQLite files."
+    echo "  --help         Display this help message."
     echo "Configuration is loaded from $CONFIG_FILE if it exists."
     echo "Secrets are loaded from $SECRETS_FILE."
     echo "Backup includes root filesystem with comprehensive exclusions."
@@ -390,6 +282,7 @@ DRY_RUN=false
 CHECK_ONLY=false
 NO_PRUNE=false
 REPO_CHECK=false
+CHECK_SQLITE=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -397,6 +290,7 @@ while [[ $# -gt 0 ]]; do
         --check-only) CHECK_ONLY=true ;;
         --no-prune) NO_PRUNE=true ;;
         --repo-check) REPO_CHECK=true ;;
+        --check-sqlite) CHECK_SQLITE=true ;;
         --help) show_help && exit 0 ;;
         *) log "FATAL: Unknown option: $1"; exit 1 ;;
     esac
@@ -422,6 +316,9 @@ export BORG_PASSPHRASE
 check_dependencies() {
     log "Checking dependencies..."
     local required_binaries=("borg" "docker" "jq" "gzip" "curl" "stat" "bc" "lsof")
+    if [ "$CHECK_SQLITE" = true ]; then
+        required_binaries+=("sqlite3")
+    fi
     for binary in "${required_binaries[@]}"; do
         command -v "$binary" >/dev/null 2>&1 || error_exit "Required binary '$binary' not found in PATH."
     done
@@ -444,7 +341,7 @@ validate_configuration() {
     [[ ! "$RETENTION_DAYS" =~ ^[0-9]+$ ]] && error_exit "RETENTION_DAYS must be a positive integer"
     [[ ! "$MIN_DISK_SPACE_GB" =~ ^[0-9]+$ ]] && error_exit "MIN_DISK_SPACE_GB must be a positive integer"
     [[ ! "$MAX_SYSTEM_LOAD" =~ ^[0-9]+(\.[0-9]+)?$ ]] && error_exit "MAX_SYSTEM_LOAD must be a number"
-    [[ ! "$SERVICE_OPERATION_TIMEOUT" =~ ^[0-9]+$ ]] && error_exit "SERVICE_OPERATION_TIMEOUT must be a positive integer"
+    [[ ! "$SERVICE_OPERATION_TIMEOUT" =~ ^[0-g]+$ ]] && error_exit "SERVICE_OPERATION_TIMEOUT must be a positive integer"
     [[ ! "$MAX_DEPENDENCY_ITERATIONS" =~ ^[0-9]+$ ]] && error_exit "MAX_DEPENDENCY_ITERATIONS must be a positive integer"
     local path_keys=("STAGING_DIR" "BORG_REPO" "DOCKER_COMPOSE_FILE" "SECRETS_FILE")
     for key in "${path_keys[@]}"; do
@@ -604,7 +501,12 @@ verify_dump_integrity() {
 
 # SIMPLIFIED: manage_services now uses explicit tracking of stopped services
 manage_services() {
-    local action="$1"; local expected_status=$([ "$action" = "start" ] && echo "running" || echo "exited")
+    local action="$1"
+    if [ ${#SERVICES_TO_STOP[@]} -eq 0 ]; then
+        log "Zero-downtime mode: No services to $action."
+        return 0
+    fi
+    local expected_status=$([ "$action" = "start" ] && echo "running" || echo "exited")
     log "${action^}ing services identified as dependent on databases..."
     
     if [ "$action" = "stop" ]; then
@@ -805,6 +707,64 @@ verify_archive_integrity() {
     log "Archive integrity and restorability verified."
 }
 
+check_backed_up_sqlite_integrity() {
+    if [ "$DRY_RUN" = true ]; then return; fi
+    log "Checking integrity of SQLite databases in the backup..."
+    
+    # Create a temporary directory for extraction
+    local temp_extract_dir
+    temp_extract_dir=$(mktemp -d "$STAGING_DIR/tmp_sqlite_XXXXXXXX" 2>/dev/null) || error_exit "Failed to create temp dir for SQLite checks"
+    # Ensure cleanup of the temp directory on function exit
+    trap 'rm -rf "$temp_extract_dir"' RETURN
+
+    # Find SQLite databases in the backup
+    local sqlite_dbs
+    sqlite_dbs=$(borg list "$BORG_REPO::$ARCHIVE_NAME" --format '{path}\n' | grep -E '\.(db|sqlite|sqlite3)$' || true)
+
+    if [ -z "$sqlite_dbs" ]; then
+        log "No SQLite databases found in the backup."
+        return
+    fi
+
+    log "Found SQLite databases, checking integrity..."
+    local check_failed=false
+    while IFS= read -r db_path; do
+        if [ -z "$db_path" ]; then continue; fi
+        
+        # Sanitize basename to prevent path traversal issues
+        local safe_basename; safe_basename=$(basename "$db_path")
+        local temp_db_file="$temp_extract_dir/$safe_basename"
+        
+        log "Checking: $db_path"
+        
+        # Extract the file directly to the temp location using stdout redirection
+        if ! borg extract "$BORG_REPO::$ARCHIVE_NAME" "$db_path" --stdout > "$temp_db_file"; then
+            log "  ERROR: Failed to extract $db_path for integrity check."
+            check_failed=true
+            continue
+        fi
+
+        # Check integrity using sqlite3
+        local integrity_result
+        integrity_result=$(sqlite3 "$temp_db_file" "PRAGMA integrity_check;" 2>&1)
+        
+        if [[ "$integrity_result" == "ok" ]]; then
+            log "  OK: Integrity verified for $db_path"
+        else
+            log "  WARNING: Integrity check FAILED for $db_path"
+            # Log the specific error from sqlite3, indenting for readability
+            while IFS= read -r line; do log "    SQLite Error: $line"; done <<< "$integrity_result"
+            check_failed=true
+        fi
+    done <<< "$sqlite_dbs"
+    
+    if [ "$check_failed" = true ]; then
+        log "WARNING: One or more SQLite database integrity checks failed. This can be normal for live databases but should be investigated."
+    else
+        log "All found SQLite databases passed integrity checks."
+    fi
+}
+
 collect_metrics() {
     if [ "$DRY_RUN" = true ]; then return; fi
     log "Collecting backup metrics..."
@@ -943,17 +903,14 @@ main() {
     # Set more specific traps inside main
     trap failure_handler ERR
 
-    log "--- Starting Enterprise Backup Script ---"
+    log "--- Starting Enterprise Backup Script (Zero-Downtime Mode) ---"
     if [ "$DRY_RUN" = true ]; then log "--- DRY RUN MODE ENABLED ---"; fi
 
     perform_pre_flight_checks
 
-    # Discover services depending on databases
-    find_dependent_services
-
     # Exit early if --check-only was specified
     if [ "$CHECK_ONLY" = true ]; then
-        log "--- Pre-flight checks and dependency discovery completed successfully ---"
+        log "--- Pre-flight checks completed successfully ---"
         return 0
     fi
 
@@ -963,22 +920,27 @@ main() {
     fi
 
     if [ "$DRY_RUN" = false ]; then
-        run_database_dumps
+        run_database_dumps # Dumps still happen, but services remain running
         verify_dump_integrity
     fi
 
-    # Stop services, run backup, then restart services
-    manage_services "stop"
+    # In zero-downtime mode, services are not stopped/started
+    # run_borg_backup captures the live filesystem state
     run_borg_backup
-    manage_services "start"
 
     verify_archive_integrity
+
+    # Run optional SQLite check if requested
+    if [ "$CHECK_SQLITE" = true ]; then
+        check_backed_up_sqlite_integrity
+    fi
+    
     collect_metrics
     print_backup_summary
     rotate_logs
 
-    log "--- Backup Script Completed Successfully ---"
-    send_notification "success" "Backup completed successfully on $HOST_ID. Archive: $ARCHIVE_NAME"
+    log "--- Backup Script Completed Successfully (Zero-Downtime Mode) ---"
+    send_notification "success" "Backup completed successfully on $HOST_ID (Zero-Downtime). Archive: $ARCHIVE_NAME"
 }
 
 # --- Singleton Execution ---
