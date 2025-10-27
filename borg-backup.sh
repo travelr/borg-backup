@@ -4,7 +4,7 @@
 #
 # REQUIREMENTS:
 # - /root/borg-backup.env: File containing sensitive credentials (BORG_PASSPHRASE, database credentials)
-# - backup-borg.conf: Configuration file in the same directory as this script
+# - borg-backup.conf: Configuration file in the same directory as this script
 # - docker compose v2: Required for container operations
 #
 # USAGE:
@@ -12,7 +12,7 @@
 #
 # SECURITY NOTES:
 # - Sensitive credentials must be in /root/borg-backup.env with 600 permissions and owned by root
-# - Non-sensitive configuration can be in backup-borg.conf in the same directory as the script
+# - Non-sensitive configuration can be in borg-backup.conf in the same directory as the script
 # - BACKUP_NOTIFY_DISCORD_WEBHOOK can be set in the script, config file, or as environment variable
 # - Script runs with umask 077 to prevent world-readable files
 #
@@ -26,10 +26,10 @@ set -E
 
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="$SCRIPT_DIR/backup-borg.conf"
+CONFIG_FILE="$SCRIPT_DIR/borg-backup.conf"
 
 ################################################################################
-# DEFAULT CONFIGURATION (can be overridden by backup-borg.conf)
+# DEFAULT CONFIGURATION (can be overridden by borg-backup.conf)
 ################################################################################
 
 # --- Core Paths & Identifiers ---
@@ -65,93 +65,62 @@ BACKUP_NOTIFY_DISCORD_WEBHOOK=""  # Can be overridden in config file
 # Define common system excludes as an array
 # These are paths Borg should *not* traverse or backup
 BORG_EXCLUDES=(
-    --exclude-caches  # Exclude standard cache directories like /home/user/.cache
-    --exclude='/proc'           # Virtual proc filesystem (process info)
-    --exclude='/sys'            # Virtual sys filesystem (device info)
-    --exclude='/dev'            # Device files (not the actual devices)
-    --exclude='/mnt'            # Mount point for other filesystems
-    --exclude='/media'          # Mount point for removable media
-    --exclude='/tmp'            # System-wide temporary files
-    --exclude='/var/tmp'        # Another system-wide temporary location
-    --exclude='/var/run'        # Runtime data (often symlink to /run)
-    --exclude='/var/lock'       # Lock files (often symlink to /run/lock)
-    --exclude='/run'            # Runtime data (sockets, PIDs, etc.)
-    --exclude='/run/*'          # Contents of /run (more specific)
-    --exclude='/lost+found'     # Filesystem metadata directory (usually at root)
-    --exclude='/var/lib/docker' # Docker's state (images, containers, networks, etc.) - STATELESS APPROACH
-    --exclude='/swapfile'       # The swap file (if using one, adjust path if different)
-    --exclude='/home/*/.npm'    # Common user-specific package cache (generic path)
-    --exclude='/home/*/.vscode-server' # Common user-specific editor data (generic path)
-    --exclude='/home/*/snap'    # Snap packages per user
-    --exclude='/home/*/.cache/*' # Generic user cache directories (optional, can be large)
-    --exclude='/var/cache'      # System-wide cache (optional, can be large, but often reproducible)
-    --exclude='/var/log/*'      # System logs (optional, often large, but potentially useful for debugging history)
-    --exclude='/home/*/.local/share/Trash' # User trash 
+    # --- Standard Borg Best Practice ---
+    --exclude-caches  # Exclude all directories containing a CACHEDIR.TAG file
+
+    # --- Virtual Filesystems (CRITICAL to exclude) ---
+    # These are not real files on disk but interfaces to the kernel. Backing them up is useless and can cause errors.
+    --exclude='/proc'
+    --exclude='/sys'
+    --exclude='/dev'
+    --exclude='/run'
+
+    # --- Temporary & Transient Data ---
+    # These files are temporary by definition and should not be backed up.
+    --exclude='/tmp'
+    --exclude='/var/tmp'
+    --exclude='/var/run'  # Often a symlink to /run
+    --exclude='/var/lock' # Often a symlink to /run/lock
+
+    # --- Mounted Filesystems ---
+    # You don't want the backup to unexpectedly cross into network drives, USB sticks, or other mounted partitions.
+    --exclude='/mnt'
+    --exclude='/media'
+
+    # --- System-Generated & Reproducible Data ---
+    # This is the key area for optimization. Exclude anything the system can rebuild on its own.
+    --exclude='/lost+found'     # Filesystem recovery data
+    --exclude='/swapfile'       # The system swap file
+    --exclude='/var/cache'      # System-wide package and application caches
+    --exclude='/var/lib/apt/lists/*' # APT package lists (rebuilt by 'apt update')
+    --exclude='/usr/src'        # Linux headers and other source files (reinstallable)
+    
+    # --- Docker: A Strategic Choice ---
+    # This excludes the entire Docker runtime (images, containers, networks).
+    # This is the correct "stateless" approach when your persistent data is in /var/lib/docker/volumes,
+    # which you are already backing up. This saves massive amounts of space.
+    --exclude='/var/lib/docker'
+
+    # --- User-Specific Reproducible Data ---
+    # Exclude common, large cache and package directories from user homes.
+    --exclude='/home/*/.cache'           # Generic user cache (covered by --exclude-caches but good to be explicit)
+    --exclude='/home/*/.npm'             # Node.js packages
+    --exclude='/home/*/.m2'              # Maven (Java) packages
+    --exclude='/home/*/.gradle'          # Gradle (Java/Android) packages
+    --exclude='/home/*/.vscode-server'   # VS Code remote server data
+    --exclude='/home/*/snap'             # User-specific snap data
+    --exclude='/home/*/.local/share/Trash' # User trash bins
+    --exclude='*/.thumbnails/*'        # Image thumbnails (will be regenerated)
+
+    # --- (Optional but Recommended) Log Files ---
+    # System logs can be huge. If you don't need a deep history for forensic purposes,
+    # excluding them can save a lot of space. The journal is often the largest.
+    --exclude='/var/log/journal'
+    --exclude='/var/log/*.gz' # Exclude rotated/compressed old logs
+    --exclude='/var/log/*.1'  # Exclude rotated old logs
 )
 
-################################################################################
-# SCRIPT INITIALIZATION
-################################################################################
 
-# Secure file creation defaults
-umask 077
-
-# --- Early runtime variables (needed for logging/error handling during parsing) ---
-START_TIME=$(date +%s)
-HOST_ID="${HOST_ID:-$(hostname --fqdn 2>/dev/null || hostname -s)}"
-TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
-ARCHIVE_NAME="${HOST_ID}-${TIMESTAMP}"
-
-# Ensure staging & log dirs exist for bootstrap logging
-mkdir -p "$STAGING_DIR"
-# Set LOG_DIR before loading config to ensure consistent logging
-LOG_DIR="$STAGING_DIR/logs"
-mkdir -p "$LOG_DIR"
-
-# Bootstrap log file (will be reused/rotated after run)
-LOG_FILE="$LOG_DIR/bootstrap_${TIMESTAMP}.log"
-touch "$LOG_FILE"
-chmod 600 "$LOG_FILE"
-
-log "Script started. Loading configuration and secrets..."
-
-# --- Load External Configuration (relative to script) ---
-if [ -f "$CONFIG_FILE" ]; then
-    log "Loading configuration from $CONFIG_FILE"
-    # shellcheck source=/dev/null
-    source "$CONFIG_FILE"
-else
-    log "No configuration file found at $CONFIG_FILE, using defaults"
-fi
-
-# --- Load Secrets (sensitive credentials only) ---
-if [ -f "$SECRETS_FILE" ]; then
-    log "Loading secrets from $SECRETS_FILE"
-    # shellcheck source=/dev/null
-    source "$SECRETS_FILE"
-else
-    log "FATAL: Secrets file $SECRETS_FILE not found"
-    exit 1
-fi
-
-# Initialize variables
-DUMPS_CREATED=false
-PROGRESS_PID=""
-DB_DUMP_DIR=""
-# Array for services found to depend on databases
-SERVICES_TO_STOP=()
-# Array to track services actually stopped by this script
-declare -a STOPPED_BY_SCRIPT=()
-
-# --- Docker Compose Detection ---
-if docker compose version >/dev/null 2>&1; then
-    DOCKER_COMPOSE_CMD=(docker compose)
-elif command -v docker-compose >/dev/null 2>&1; then
-    DOCKER_COMPOSE_CMD=(docker-compose)
-else
-    log "FATAL: docker compose v2 required"
-    exit 1
-fi
 
 ################################################################################
 # HELPER & UTILITY FUNCTIONS
@@ -335,6 +304,70 @@ find_dependent_services() {
 
     log "Services identified for stop/start during backup: ${SERVICES_TO_STOP[*]}"
 }
+
+################################################################################
+# SCRIPT INITIALIZATION
+################################################################################
+
+# Secure file creation defaults
+umask 077
+
+# --- Early runtime variables (needed for logging/error handling during parsing) ---
+START_TIME=$(date +%s)
+HOST_ID="${HOST_ID:-$(hostname --fqdn 2>/dev/null || hostname -s)}"
+TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+ARCHIVE_NAME="${HOST_ID}-${TIMESTAMP}"
+
+# Ensure staging & log dirs exist for bootstrap logging
+mkdir -p "$STAGING_DIR"
+# Set LOG_DIR before loading config to ensure consistent logging
+LOG_DIR="$STAGING_DIR/logs"
+mkdir -p "$LOG_DIR"
+
+# Bootstrap log file (will be reused/rotated after run)
+LOG_FILE="$LOG_DIR/bootstrap_${TIMESTAMP}.log"
+touch "$LOG_FILE"
+chmod 600 "$LOG_FILE"
+
+log "Script started. Loading configuration and secrets..."
+
+# --- Load External Configuration (relative to script) ---
+if [ -f "$CONFIG_FILE" ]; then
+    log "Loading configuration from $CONFIG_FILE"
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+else
+    log "No configuration file found at $CONFIG_FILE, using defaults"
+fi
+
+# --- Load Secrets (sensitive credentials only) ---
+if [ -f "$SECRETS_FILE" ]; then
+    log "Loading secrets from $SECRETS_FILE"
+    # shellcheck source=/dev/null
+    source "$SECRETS_FILE"
+else
+    log "FATAL: Secrets file $SECRETS_FILE not found"
+    exit 1
+fi
+
+# Initialize variables
+DUMPS_CREATED=false
+PROGRESS_PID=""
+DB_DUMP_DIR=""
+# Array for services found to depend on databases
+SERVICES_TO_STOP=()
+# Array to track services actually stopped by this script
+declare -a STOPPED_BY_SCRIPT=()
+
+# --- Docker Compose Detection ---
+if docker compose version >/dev/null 2>&1; then
+    DOCKER_COMPOSE_CMD=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+    DOCKER_COMPOSE_CMD=(docker-compose)
+else
+    log "FATAL: docker compose v2 required"
+    exit 1
+fi
 
 ################################################################################
 # COMMAND-LINE ARGUMENT PARSING
@@ -636,7 +669,7 @@ run_borg_backup() {
     log "Starting Borg backup of root filesystem..."
     local BORG_DRY_RUN_OPTS=()
     if [ "$DRY_RUN" = true ]; then
-        BORG_DRY_RUN_OPTS=(--dry-run --list)
+        BORG_DRY_RUN_OPTS=(--dry-run)
     elif [ ! -d "$BORG_REPO" ]; then
         log "Initializing Borg repo..."
         # Ensure parent directory exists
@@ -650,20 +683,30 @@ run_borg_backup() {
     local borg_args=(
         "${RESOURCE_NICE_CMD[@]}" 
         borg create 
-        --stats 
         --one-file-system 
         --compression "$BORG_COMPRESSION" 
-        "${BORG_DRY_RUN_OPTS[@]}"
-        "${BORG_EXCLUDES[@]}"
-        "$BORG_REPO::$ARCHIVE_NAME"
     )
-    
+
+    # Add --stats only if not in dry run mode
+    if [ "$DRY_RUN" != true ]; then
+        borg_args+=(--stats)
+    fi
+
+    # Add dry run options
+    borg_args+=("${BORG_DRY_RUN_OPTS[@]}")
+
+    # Add excludes
+    borg_args+=("${BORG_EXCLUDES[@]}")
+
+    # Add repository and archive name
+    borg_args+=("$BORG_REPO::$ARCHIVE_NAME")
+
     # Append backup dirs (just root in this case)
     borg_args+=("${BACKUP_DIRS[@]}")
-    
+
     # Append DB dump dir only if it was created and exists
     if [ "$DUMPS_CREATED" = true ] && [ -d "$DB_DUMP_DIR" ]; then
-      borg_args+=("$DB_DUMP_DIR")
+    borg_args+=("$DB_DUMP_DIR")
     fi
     
     start_progress "Creating backup archive"
@@ -673,10 +716,17 @@ run_borg_backup() {
     fi
     stop_progress
 
-    if [ "$NO_PRUNE" = false ]; then
-        start_progress "Pruning old archives"
-        "${RESOURCE_NICE_CMD[@]}" borg prune -v --list "${BORG_DRY_RUN_OPTS[@]}" "$BORG_REPO" --keep-daily=$RETENTION_DAYS
-        stop_progress
+    if [ "$NO_PRUNE" = false ] && [ "$DRY_RUN" != true ]; then
+        # Only prune if repository exists and not in dry run mode
+        if [ -d "$BORG_REPO" ]; then
+            start_progress "Pruning old archives"
+            "${RESOURCE_NICE_CMD[@]}" borg prune -v --list "${BORG_DRY_RUN_OPTS[@]}" "$BORG_REPO" --keep-daily=$RETENTION_DAYS
+            stop_progress
+        else
+            log "Skipping pruning - Borg repository does not exist at $BORG_REPO"
+        fi
+    elif [ "$NO_PRUNE" = false ] && [ "$DRY_RUN" = true ]; then
+        log "DRY RUN: Would prune old archives (keeping $RETENTION_DAYS daily archives)"
     fi
 }
 
