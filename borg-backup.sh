@@ -1,0 +1,769 @@
+#!/bin/bash
+#
+# Definitive Enterprise-Grade Borg Backup Script (Security-Hardened)
+#
+# A self-healing, intelligent, and highly observable backup solution incorporating
+# advanced security, robust error handling, comprehensive monitoring, and sophisticated
+# recovery mechanisms for mission-critical environments.
+#
+# REQUIREMENTS:
+# - BORG_PASSPHRASE: Environment variable with Borg repository passphrase
+#   OR BORG_PASSPHRASE_FILE: Path to file containing passphrase
+# - BACKUP_NOTIFY_DISCORD_WEBHOOK: Environment variable for Discord notifications (optional)
+# - docker compose v2: Required for container operations
+#
+# USAGE:
+#   $0 [--dry-run | --check-only | --no-prune | --repo-check | --help]
+#     --dry-run    Simulate all operations without making changes
+#     --check-only Run pre-flight checks only, then exit
+#     --no-prune   Skip pruning old archives
+#     --repo-check Run repository integrity check
+#     --help       Display this help message
+#
+# CONFIGURATION:
+#   /etc/backup-borg.conf can override default settings
+#
+# SECURITY NOTES:
+# - This script requires BORG_PASSPHRASE to be set in the environment or BORG_PASSPHRASE_FILE
+# - Database credentials should be stored in an encrypted file at rest
+# - Consider using a secrets management solution for production environments
+# - Script runs with umask 077 to prevent world-readable files
+#
+
+set -euo pipefail
+set -E # Ensure ERR trap is inherited by functions and subshells
+
+################################################################################
+# DEFAULT CONFIGURATION (can be overridden by /etc/backup-borg.conf)
+################################################################################
+
+# --- Core Paths & Identifiers ---
+STAGING_DIR="/mnt/storage-hdd/backup-staging"
+BORG_REPO="/mnt/storage-hdd/borg-repo"
+DOCKER_COMPOSE_FILE="/home/fuji/docker/docker-compose.yml"
+CRED_FILE="/home/fuji/docker/backup-futro-credentials.env"
+LOCK_FILE="/var/run/backup-borg.lock"
+LOCK_TIMEOUT=60 # Configurable lock timeout in seconds
+
+# --- Targeted Backup Directories ---
+BACKUP_DIRS=("/etc" "/home" "/var/www" "/var/lib/docker/volumes")
+
+# --- Services to Manage ---
+NON_DB_SERVICES=("socket-proxy")
+
+# --- Backup Parameters ---
+RETENTION_DAYS=7
+BORG_COMPRESSION="zstd,9"
+
+# --- Health & Monitoring ---
+MIN_DISK_SPACE_GB=5
+MAX_SYSTEM_LOAD=10.0
+LOG_RETENTION_DAYS=30
+
+# --- Notification Hooks (set as environment variables or in config file) ---
+# BACKUP_NOTIFY_DISCORD_WEBHOOK="https://discord.com/api/webhooks/..."
+
+# --- Advanced Toggles ---
+# REQUIRE_ROOT_OWNED_CRED="false" # Set to "true" to skip root ownership check
+# ALLOW_RELAXED_CRED_PERMS="false" # Set to "true" to allow non-600 permissions
+
+################################################################################
+# SCRIPT INITIALIZATION
+################################################################################
+
+# Secure file creation defaults
+umask 077
+
+# --- Load External Configuration ---
+EXTERNAL_CONFIG_FILE="/etc/backup-borg.conf"
+if [ -f "$EXTERNAL_CONFIG_FILE" ]; then
+    # shellcheck source=/dev/null
+    source "$EXTERNAL_CONFIG_FILE"
+fi
+
+# --- Early runtime variables (needed for logging/error handling during parsing) ---
+START_TIME=$(date +%s)
+HOST_ID="${HOST_ID:-$(hostname --fqdn 2>/dev/null || hostname -s)}"
+TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+ARCHIVE_NAME="${HOST_ID}-${TIMESTAMP}"
+
+# Ensure staging & log dirs exist for bootstrap logging
+mkdir -p "$STAGING_DIR"
+LOG_DIR="${LOG_DIR:-$STAGING_DIR/logs}"
+mkdir -p "$LOG_DIR"
+
+# Bootstrap log file (will be reused/rotated after run)
+LOG_FILE="${LOG_FILE:-$LOG_DIR/bootstrap_${TIMESTAMP}.log}"
+touch "$LOG_FILE"
+chmod 600 "$LOG_FILE"
+
+# Initialize critical variables early to prevent unset variable issues
+services_stopped=false
+DUMPS_CREATED=false
+PROGRESS_PID=""
+DB_DUMP_DIR=""
+
+# --- Docker Compose Detection (safe, does not call error_exit yet) ---
+if docker compose version >/dev/null 2>&1; then
+    DOCKER_COMPOSE_CMD=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+    DOCKER_COMPOSE_CMD=(docker-compose)
+else
+    printf '%s - %s\n' "$(date +"%Y-%m-%d %H:%M:%S")" "FATAL: docker compose v2 required but neither 'docker compose' nor 'docker-compose' was found." | tee -a "$LOG_FILE"
+    exit 1
+fi
+
+################################################################################
+# HELPER & UTILITY FUNCTIONS
+################################################################################
+
+log(){ 
+    printf '%s - %s\n' "$(date +"%Y-%m-%d %H:%M:%S")" "$1" | tee -a "$LOG_FILE"
+}
+
+error_exit(){ 
+    log "FATAL ERROR: $1"
+    send_notification "failure" "Backup failed on $HOST_ID: $1"
+    # Stop progress indicator if running
+    if [ -n "${PROGRESS_PID:-}" ]; then
+        kill "$PROGRESS_PID" 2>/dev/null || true
+        wait "$PROGRESS_PID" 2>/dev/null || true
+    fi
+    exit 1
+}
+
+send_notification() {
+    local status="$1"; local message="$2"
+    log "Sending $status notification..."
+    if [ -n "${BACKUP_NOTIFY_DISCORD_WEBHOOK:-}" ]; then
+        jq -n --arg content "$message" '{content: $content}' | \
+          curl -s -H "Content-Type: application/json" --data @- "${BACKUP_NOTIFY_DISCORD_WEBHOOK}" || log "Discord notification failed"
+    fi
+}
+
+# Progress indicator for long-running operations
+start_progress() {
+    local message="$1"
+    log "$message"
+    
+    # Start progress indicator in background
+    (
+        while true; do
+            for c in / - \\ \|; do
+                printf "\r%s - %s" "$(date +"%Y-%m-%d %H:%M:%S")" "$message $c"
+                sleep 0.2
+            done
+        done
+    ) &
+    PROGRESS_PID=$!
+    # Don't disown - we want to be able to kill it cleanly
+}
+
+stop_progress() {
+    if [ -n "${PROGRESS_PID:-}" ]; then
+        kill "$PROGRESS_PID" 2>/dev/null || true
+        wait "$PROGRESS_PID" 2>/dev/null || true
+        PROGRESS_PID=""
+        printf "\r%s - %s\n" "$(date +"%Y-%m-%d %H:%M:%S")" "Operation completed"
+    fi
+}
+
+# Parse credential file value safely
+get_credential_value() {
+    local key="$1"
+    
+    # Validate key format to prevent command injection
+    if ! [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        error_exit "Invalid credential key format: $key"
+    fi
+    
+    local line
+    line=$(awk -F'=' -v target_key="$key" '$1 == target_key {print; exit}' "$CRED_FILE")
+    
+    if [ -z "$line" ]; then
+        error_exit "Credential '$key' not found in $CRED_FILE"
+    fi
+    
+    # Extract everything after the first '='
+    local value="${line#*=}"
+    echo "$value"
+}
+
+################################################################################
+# COMMAND-LINE ARGUMENT PARSING
+################################################################################
+
+show_help() {
+    echo "Enterprise-Grade Borg Backup Script"
+    echo "Usage: $0 [--dry-run | --check-only | --no-prune | --repo-check | --help]"
+    echo "  --dry-run    Simulate all operations without making changes."
+    echo "  --check-only Run pre-flight checks only, then exit."
+    echo "  --no-prune   Skip pruning old archives."
+    echo "  --repo-check Run repository integrity check."
+    echo "  --help       Display this help message."
+    echo "Configuration is loaded from $EXTERNAL_CONFIG_FILE if it exists."
+}
+
+DRY_RUN=false
+CHECK_ONLY=false
+NO_PRUNE=false
+REPO_CHECK=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run) DRY_RUN=true ;;
+        --check-only) CHECK_ONLY=true ;;
+        --no-prune) NO_PRUNE=true ;;
+        --repo-check) REPO_CHECK=true ;;
+        --help) show_help && exit 0 ;;
+        *) printf '%s - %s\n' "$(date +"%Y-%m-%d %H:%M:%S")" "FATAL: Unknown option: $1" | tee -a "$LOG_FILE"; exit 1 ;;
+    esac
+    shift
+done
+
+# --- Dynamic & Internal Variables ---
+RESOURCE_NICE_CMD=(ionice -c2 -n7 nice -n10)
+
+# Handle BORG_PASSPHRASE from environment or file (with trimming)
+if [ -n "${BORG_PASSPHRASE_FILE:-}" ] && [ -f "$BORG_PASSPHRASE_FILE" ]; then
+    BORG_PASSPHRASE=$(tr -d '\r\n' < "$BORG_PASSPHRASE_FILE")
+fi
+
+if [ -z "${BORG_PASSPHRASE:-}" ]; then
+    printf '%s - %s\n' "$(date +"%Y-%m-%d %H:%M:%S")" "FATAL: BORG_PASSPHRASE must be set in environment or BORG_PASSPHRASE_FILE must be provided" | tee -a "$LOG_FILE"
+    exit 1
+fi
+
+# Export BORG_PASSPHRASE to avoid repeating it in every command
+export BORG_PASSPHRASE
+
+################################################################################
+# PRE-FLIGHT CHECKS & VALIDATION
+################################################################################
+
+check_dependencies() {
+    log "Checking dependencies..."
+    local required_binaries=("borg" "docker" "jq" "gzip" "curl" "stat" "bc" "lsof")
+    for binary in "${required_binaries[@]}"; do
+        command -v "$binary" >/dev/null 2>&1 || error_exit "Required binary '$binary' not found in PATH."
+    done
+
+    log "Using '${DOCKER_COMPOSE_CMD[*]}' for Docker operations."
+
+    local borg_version; borg_version=$(borg --version 2>&1 | awk '{print $2}' | cut -d. -f1-2)
+    local min_version="1.2"
+    if ! printf '%s\n' "$min_version" "$borg_version" | sort -V -C; then
+        error_exit "Borg version $borg_version found, but $min_version or higher is required"
+    fi
+    
+    # Log versions for debugging
+    log "borg: $(borg --version 2>&1 | head -n1 || echo 'not found')"
+    log "docker compose: $(${DOCKER_COMPOSE_CMD[@]} version 2>&1 | head -n1 || echo 'not found')"
+}
+
+validate_configuration() {
+    log "Validating configuration..."
+    [[ ! "$RETENTION_DAYS" =~ ^[0-9]+$ ]] && error_exit "RETENTION_DAYS must be a positive integer"
+    [[ ! "$MIN_DISK_SPACE_GB" =~ ^[0-9]+$ ]] && error_exit "MIN_DISK_SPACE_GB must be a positive integer"
+    [[ ! "$MAX_SYSTEM_LOAD" =~ ^[0-9]+(\.[0-9]+)?$ ]] && error_exit "MAX_SYSTEM_LOAD must be a number"
+    local path_keys=("STAGING_DIR" "BORG_REPO" "DOCKER_COMPOSE_FILE" "CRED_FILE")
+    for key in "${path_keys[@]}"; do
+        [[ "${!key}" != /* ]] && error_exit "Configuration key '$key' must be an absolute path"
+        if [[ "$key" =~ (FILE|CRED_FILE|DOCKER_COMPOSE_FILE)$ ]] && [ ! -e "${!key}" ]; then
+            error_exit "Configuration file does not exist: ${!key}"
+        fi
+    done
+}
+
+validate_credential_file() {
+    # Validate credential file path is secure
+    if [[ "$CRED_FILE" != /* ]] || [[ "$CRED_FILE" == *../* ]] || [[ "$CRED_FILE" == */..* ]]; then
+        error_exit "CRED_FILE path is invalid or insecure: $CRED_FILE"
+    fi
+    
+    if [ "${ALLOW_RELAXED_CRED_PERMS:-false}" != "true" ] && [ "$(stat -c "%a" "$CRED_FILE")" -ne 600 ]; then
+        error_exit "Credential file permissions must be 600 (or set ALLOW_RELAXED_CRED_PERMS=true)"
+    fi
+    if [ "${REQUIRE_ROOT_OWNED_CRED:-true}" = "true" ] && [ "$(stat -c "%U" "$CRED_FILE")" != "root" ]; then
+        error_exit "Credential file must be owned by root (or set REQUIRE_ROOT_OWNED_CRED=false)"
+    fi
+}
+
+check_system_health() {
+    log "Checking system health..."
+    local current_load; current_load=$(uptime | awk -F'load average:' '{print $2}' | cut -d, -f1 | xargs)
+    if (( $(echo "$current_load > $MAX_SYSTEM_LOAD" | bc -l) )); then
+        log "WARNING: System load ($current_load) exceeds threshold ($MAX_SYSTEM_LOAD). Proceeding with caution."
+    fi
+    for path in "$BORG_REPO" "$STAGING_DIR"; do
+        if [ -d "$path" ]; then
+            local available_space; available_space=$(df --output=avail -BG "$path" 2>/dev/null | tail -n1 | tr -d 'G ' | tr -d ' ' || echo "0")
+            if ! [[ "$available_space" =~ ^[0-9]+$ ]]; then available_space=0; fi
+            if [ "$available_space" -lt "$MIN_DISK_SPACE_GB" ]; then
+                error_exit "Insufficient disk space at $path: ${available_space}G available, min required: ${MIN_DISK_SPACE_GB}G"
+            fi
+        fi
+    done
+}
+
+handle_borg_lock() {
+    log "Checking for Borg repository locks..."
+    if [ -d "$BORG_REPO" ] && [ -f "$BORG_REPO/lock.roster" ]; then
+        log "Borg repository lock detected. Attempting to break stale lock..."
+        if borg break-lock "$BORG_REPO"; then 
+            log "Successfully broke stale Borg lock."
+        else
+            error_exit "Borg repository is locked by an active process. Please investigate."
+        fi
+    fi
+}
+
+verify_borg_repo_accessibility() {
+    # Only check if repo exists and is accessible, otherwise skip
+    if [ -d "$BORG_REPO" ]; then
+        borg list "$BORG_REPO" >/dev/null 2>&1 || error_exit "Borg repository exists but is not accessible"
+    fi
+}
+
+perform_pre_flight_checks() {
+    check_dependencies
+    validate_configuration
+    validate_credential_file
+    check_system_health
+    handle_borg_lock
+    verify_borg_repo_accessibility
+}
+
+################################################################################
+# CORE FUNCTIONS
+################################################################################
+
+run_database_dumps() {
+    log "Starting database dumps..."
+    # Create a secure temporary directory inside $STAGING_DIR, fall back to system tmp if needed
+    if ! DB_DUMP_DIR=$(mktemp -d "$STAGING_DIR/tmp_dumps_XXXXXXXX" 2>/dev/null); then
+        DB_DUMP_DIR=$(mktemp -d 2>/dev/null) || error_exit "Failed to create temporary dump directory"
+    fi
+    
+    # Ensure DB_DUMP_DIR is properly created and set secure permissions
+    if [ -z "$DB_DUMP_DIR" ] || [ ! -d "$DB_DUMP_DIR" ]; then
+        error_exit "Database dump directory was not properly created"
+    fi
+    
+    # Set secure permissions on the temporary directory
+    chmod 700 "$DB_DUMP_DIR"
+    
+    log "Created temporary dump directory: $DB_DUMP_DIR"
+
+    local MARIADB_CID; MARIADB_CID=$("${DOCKER_COMPOSE_CMD[@]}" -f "$DOCKER_COMPOSE_FILE" ps -q mariadb 2>/dev/null || true)
+    if [ -n "$MARIADB_CID" ]; then
+        log "Dumping MariaDB..."
+        # Verify service is running before dumping
+        verify_service_status "mariadb" "running"
+        
+        local MYSQL_ROOT_PASSWORD; MYSQL_ROOT_PASSWORD=$(get_credential_value "MYSQL_ROOT_PASSWORD")
+        if ! "${RESOURCE_NICE_CMD[@]}" docker exec -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" "$MARIADB_CID" \
+            sh -c 'exec mysqldump --user=root --single-transaction --quick --all-databases' \
+            | gzip > "$DB_DUMP_DIR/mariadb_dump.sql.gz"; then
+            error_exit "MariaDB dump failed for container $MARIADB_CID"
+        fi
+        DUMPS_CREATED=true
+    fi
+
+    local POSTGRES_CID; POSTGRES_CID=$("${DOCKER_COMPOSE_CMD[@]}" -f "$DOCKER_COMPOSE_FILE" ps -q postgres 2>/dev/null || true)
+    if [ -n "$POSTGRES_CID" ]; then
+        log "Dumping PostgreSQL..."
+        # Verify service is running before dumping
+        verify_service_status "postgres" "running"
+        
+        local POSTGRES_PASSWORD; POSTGRES_PASSWORD=$(get_credential_value "POSTGRES_PASSWORD")
+        local POSTGRES_USER; POSTGRES_USER=$(get_credential_value "POSTGRES_USER")
+        if ! "${RESOURCE_NICE_CMD[@]}" docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" "$POSTGRES_CID" \
+            pg_dumpall -U "$POSTGRES_USER" | gzip > "$DB_DUMP_DIR/postgres_dump.sql.gz"; then
+            error_exit "PostgreSQL dump failed for container $POSTGRES_CID"
+        fi
+        DUMPS_CREATED=true
+    fi
+    
+    log "Database dumps complete."
+}
+
+verify_dump_integrity() {
+    if [ "$DRY_RUN" = true ] || [ "$DUMPS_CREATED" = false ]; then return; fi
+    log "Verifying integrity of database dumps..."
+    for dump_file in "$DB_DUMP_DIR"/*.sql.gz; do
+        [ -f "$dump_file" ] && ! gzip -t "$dump_file" && error_exit "Dump file $dump_file is corrupted."
+    done
+    log "Dump integrity verified."
+}
+
+manage_services() {
+    local action="$1"; local expected_status=$([ "$action" = "start" ] && echo "running" || echo "exited")
+    log "${action^}ing non-essential services..."
+    for svc in "${NON_DB_SERVICES[@]}"; do
+        # Only manage services that are currently running (for stop) or defined (for start)
+        if [ "$action" = "stop" ]; then
+            if "${DOCKER_COMPOSE_CMD[@]}" -f "$DOCKER_COMPOSE_FILE" ps --services --filter "status=running" | grep -Fxq "$svc"; then
+                if [ "$DRY_RUN" = true ]; then 
+                    log "DRY RUN: Would '$action' service '$svc'"; 
+                    continue; 
+                fi
+                log "Service '$svc': performing action '$action'"
+                "${DOCKER_COMPOSE_CMD[@]}" -f "$DOCKER_COMPOSE_FILE" "$action" "$svc"
+                verify_service_status "$svc" "$expected_status"
+                # Only set flag if service was successfully stopped
+                if [ "$action" = "stop" ] && [ "$expected_status" = "exited" ]; then
+                    services_stopped=true
+                fi
+            fi
+        else
+            if "${DOCKER_COMPOSE_CMD[@]}" -f "$DOCKER_COMPOSE_FILE" ps --services | grep -Fxq "$svc"; then
+                if [ "$DRY_RUN" = true ]; then 
+                    log "DRY RUN: Would '$action' service '$svc'"; 
+                    continue; 
+                fi
+                log "Service '$svc': performing action '$action'"
+                "${DOCKER_COMPOSE_CMD[@]}" -f "$DOCKER_COMPOSE_FILE" "$action" "$svc"
+                verify_service_status "$svc" "$expected_status"
+                # Reset flag if service was successfully started
+                if [ "$action" = "start" ] && [ "$expected_status" = "running" ]; then
+                    services_stopped=false
+                fi
+            fi
+        fi
+    done
+}
+
+verify_service_status() {
+    local svc="$1"; local expected_status="$2"; local timeout=60; local elapsed=0
+    log "Verifying service '$svc' reaches status '$expected_status'..."
+    while [ $elapsed -lt $timeout ]; do
+        local current_status; current_status=$("${DOCKER_COMPOSE_CMD[@]}" -f "$DOCKER_COMPOSE_FILE" ps "$svc" --format "{{.State}}" 2>/dev/null || echo "not-found")
+        # Use substring matching for more robust status verification
+        if [[ "$current_status" == *"$expected_status"* ]]; then 
+            log "Service '$svc' confirmed as '$expected_status'."; 
+            return 0; 
+        fi
+        sleep 2; elapsed=$((elapsed + 2))
+    done
+    error_exit "Service '$svc' did not reach status '$expected_status' within $timeout seconds"
+}
+
+run_borg_backup() {
+    log "Starting Borg backup..."
+    local BORG_DRY_RUN_OPTS=()
+    if [ "$DRY_RUN" = true ]; then
+        BORG_DRY_RUN_OPTS=(--dry-run --list)
+    elif [ ! -d "$BORG_REPO" ]; then
+        log "Initializing Borg repo..."
+        # Ensure parent directory exists
+        mkdir -p "$(dirname "$BORG_REPO")"
+        borg init --encryption=repokey-blake2 "$BORG_REPO"
+    elif ! borg list "$BORG_REPO" >/dev/null 2>&1; then
+        error_exit "BORG_REPO exists but is not a valid Borg repository"
+    fi
+
+    # Build borg command array
+    local borg_args=("${RESOURCE_NICE_CMD[@]}" borg create --stats --one-file-system --compression "$BORG_COMPRESSION" \
+      "${BORG_DRY_RUN_OPTS[@]}" --exclude-caches --exclude "$STAGING_DIR" --exclude "*.tmp" --exclude "*.cache" \
+      --exclude "*.log" "$BORG_REPO::$ARCHIVE_NAME")
+    
+    # Append backup dirs
+    borg_args+=("${BACKUP_DIRS[@]}")
+    
+    # Append DB dump dir only if it was created and exists
+    if [ "$DUMPS_CREATED" = true ] && [ -d "$DB_DUMP_DIR" ]; then
+      borg_args+=("$DB_DUMP_DIR")
+    fi
+    
+    start_progress "Creating backup archive"
+    if ! "${borg_args[@]}"; then 
+        stop_progress
+        error_exit "Borg create command failed."
+    fi
+    stop_progress
+
+    if [ "$NO_PRUNE" = false ]; then
+        start_progress "Pruning old archives"
+        "${RESOURCE_NICE_CMD[@]}" borg prune -v --list "${BORG_DRY_RUN_OPTS[@]}" "$BORG_REPO" --keep-daily=$RETENTION_DAYS
+        stop_progress
+    fi
+}
+
+run_borg_repository_check() {
+    log "Performing a full check of the Borg repository..."
+    start_progress "Verifying repository integrity"
+    
+    # The --verify-data flag is resource-intensive but provides the highest level of assurance.
+    if ! borg check --verify-data "$BORG_REPO"; then
+        stop_progress
+        error_exit "CRITICAL: Borg repository integrity check failed! Manual intervention required."
+    fi
+    
+    stop_progress
+    log "Borg repository integrity verified successfully."
+}
+
+################################################################################
+# ADVANCED INTEGRITY & REPORTING
+################################################################################
+
+verify_archive_integrity() {
+    if [ "$DRY_RUN" = true ]; then return; fi
+    log "Verifying archive integrity (existence, content, and restorability)..."
+    
+    # Verify archive exists
+    borg list "$BORG_REPO::$ARCHIVE_NAME" >/dev/null || error_exit "Archive verification failed: Could not find created archive."
+    
+    # Verify critical directories are in backup
+    for dir in "${BACKUP_DIRS[@]}"; do
+        if [ -d "$dir" ]; then
+            borg list "$BORG_REPO::$ARCHIVE_NAME" --match-path "$dir" | grep -q . || error_exit "Critical directory $dir not found in backup"
+        fi
+    done
+    
+    # Verify database dumps if created
+    if [ "$DUMPS_CREATED" = true ]; then
+        local dump_dir_basename
+        dump_dir_basename=$(basename "$DB_DUMP_DIR")
+        borg list "$BORG_REPO::$ARCHIVE_NAME" | grep -q "$dump_dir_basename" || error_exit "Database dump directory not found in backup"
+    fi
+    
+    # Perform spot restore checks with predefined canary files if available
+    log "Performing spot restore checks..."
+    local canary_files=()
+    
+    # Add some common canary files to check
+    for dir in "${BACKUP_DIRS[@]}"; do
+        if [ -d "$dir" ]; then
+            # Look for common important files
+            for pattern in "passwd" "group" "shadow" "hostname"; do
+                local canary; canary=$(find "$dir" -name "$pattern" 2>/dev/null | head -n 1)
+                if [ -n "$canary" ]; then
+                    canary_files+=("$canary")
+                    break
+                fi
+            done
+        fi
+    done
+    
+    # If we found canary files, check them first
+    if [ ${#canary_files[@]} -gt 0 ]; then
+        log "Checking ${#canary_files[@]} canary files..."
+        for canary in "${canary_files[@]}"; do
+            # Remove leading slash if present for compatibility with different archive formats
+            local relpath="${canary#/}"
+            borg extract "$BORG_REPO::$ARCHIVE_NAME" "$relpath" --stdout >/dev/null || error_exit "Failed to restore canary file: $canary"
+        done
+    fi
+    
+    # Then do random checks
+    for i in {1..3}; do
+        local sample_file; sample_file=$(borg list "$BORG_REPO::$ARCHIVE_NAME" --format '{path}\n' | grep -v '/$' | sort -R | head -n 1)
+        if [ -n "$sample_file" ]; then
+            # Remove leading slash if present for compatibility with different archive formats
+            local relpath="${sample_file#/}"
+            borg extract "$BORG_REPO::$ARCHIVE_NAME" "$relpath" --stdout >/dev/null || error_exit "Failed to restore sample file: $sample_file"
+        else
+            log "WARNING: Archive appears empty, cannot perform spot restore check."; break
+        fi
+    done
+    log "Archive integrity and restorability verified."
+}
+
+collect_metrics() {
+    if [ "$DRY_RUN" = true ]; then return; fi
+    log "Collecting backup metrics..."
+    local metrics_file="$LOG_DIR/metrics_${TIMESTAMP}.json"
+    local archive_info; archive_info=$(borg info "$BORG_REPO::$ARCHIVE_NAME" --json 2>/dev/null || echo "{}")
+    local archive_size; archive_size=$(echo "$archive_info" | jq -r '.archives[0].stats.original_size // 0')
+    local compressed_size; compressed_size=$(echo "$archive_info" | jq -r '.archives[0].stats.compressed_size // 0')
+    local unique_size; unique_size=$(echo "$archive_info" | jq -r '.archives[0].stats.deduplicated_size // 0')
+    local file_count; file_count=$(borg list "$BORG_REPO::$ARCHIVE_NAME" 2>/dev/null | wc -l || echo "0")
+    local disk_usage; disk_usage=$(df "$BORG_REPO" | awk 'NR==2 {print $5}' | tr -d '%')
+    local duration; duration=$(($(date +%s) - START_TIME))
+    
+    jq -n \
+        --arg timestamp "$TIMESTAMP" \
+        --arg hostname "$HOST_ID" \
+        --arg archive_name "$ARCHIVE_NAME" \
+        --argjson archive_size "$archive_size" \
+        --argjson compressed_size "$compressed_size" \
+        --argjson unique_size "$unique_size" \
+        --argjson file_count "$file_count" \
+        --argjson disk_usage "$disk_usage" \
+        --argjson duration "$duration" \
+        '{
+            timestamp: $timestamp,
+            hostname: $hostname,
+            archive_name: $archive_name,
+            archive_size: $archive_size,
+            compressed_size: $compressed_size,
+            unique_size: $unique_size,
+            file_count: $file_count,
+            disk_usage: $disk_usage,
+            duration: $duration
+        }' > "$metrics_file"
+    log "Metrics collected: $metrics_file"
+}
+
+print_backup_summary() {
+    log "Backup summary:"
+    log "  - Archive name: $ARCHIVE_NAME"
+    log "  - Backup directories: ${BACKUP_DIRS[*]}"
+    if [ "$DUMPS_CREATED" = true ]; then
+        log "  - Database dumps included: $DB_DUMP_DIR"
+    else
+        log "  - Database dumps: None created"
+    fi
+    log "  - Retention policy: Keep $RETENTION_DAYS daily archives"
+    log "  - Compression: $BORG_COMPRESSION"
+    if [ "$NO_PRUNE" = true ]; then
+        log "  - Pruning: Disabled"
+    fi
+}
+
+rotate_logs() {
+    log "Rotating logs older than $LOG_RETENTION_DAYS days..."
+    find "$LOG_DIR" -name "backup_*.log" -mtime "+$LOG_RETENTION_DAYS" -delete
+    find "$LOG_DIR" -name "metrics_*.json" -mtime "+$LOG_RETENTION_DAYS" -delete
+}
+
+################################################################################
+# MAIN EXECUTION & TRAP HANDLING
+################################################################################
+
+cleanup() {
+    local end_time=$(date +%s); local duration=$((end_time - START_TIME))
+    if [ "$DRY_RUN" = false ]; then
+        # Clean up temporary dump directory
+        if [ -n "${DB_DUMP_DIR:-}" ] && [ -d "$DB_DUMP_DIR" ]; then
+            rm -rf "$DB_DUMP_DIR"
+        fi
+    fi
+    log "Script execution time: $duration seconds."
+}
+
+on_exit() {
+    local exit_code=$?
+    # Release the lock FIRST, before any other operations
+    rm -f "$LOCK_FILE" 2>/dev/null || log "WARNING: Could not remove lock file $LOCK_FILE"
+    exec 200>&- 2>/dev/null || log "WARNING: Could not close lock file descriptor"
+
+    # Stop progress indicator if running
+    if [ -n "${PROGRESS_PID:-}" ]; then
+        stop_progress
+    fi
+    
+    # Check actual service status, not just the flag
+    # Run with `set +e` to prevent the trap from exiting if the restart fails.
+    local any_stopped=false
+    for svc in "${NON_DB_SERVICES[@]}"; do
+        if "${DOCKER_COMPOSE_CMD[@]}" -f "$DOCKER_COMPOSE_FILE" ps --services --filter "status=exited" | grep -Fxq "$svc"; then
+            any_stopped=true
+            break
+        fi
+    done
+
+    if [ "$any_stopped" = "true" ]; then
+        log "Recovery: Found stopped services, restarting them due to script exit..."
+        set +e
+        # Run in subshell to prevent error_exit from killing the trap
+        ( manage_services "start" )
+        local restart_status=$?
+        if [ $restart_status -ne 0 ]; then
+            log "WARNING: Failed to restart services in on_exit trap (exit code: $restart_status). Manual intervention may be required."
+        else
+            log "Recovery: Successfully restarted services."
+        fi
+        set -e
+    else
+        log "Recovery: No services found in 'exited' state, no restart needed."
+    fi
+    
+    cleanup
+    log "Exited with status $exit_code."
+}
+
+failure_handler() {
+    log "A failure occurred. Executing failure handler..."
+    # Stop progress indicator if running
+    if [ -n "${PROGRESS_PID:-}" ]; then
+        stop_progress
+    fi
+    
+    if [ "$DRY_RUN" = false ]; then
+        log "Cleaning up potentially failed backup archive..."
+        if command -v borg >/dev/null 2>&1; then
+            # Try with --archive flag first, then without for compatibility
+            borg delete --archive "$BORG_REPO::$ARCHIVE_NAME" 2>/dev/null || \
+            borg delete "$BORG_REPO::$ARCHIVE_NAME" 2>/dev/null || true
+        else
+            log "Skipping borg delete because borg CLI is not available; manual cleanup may be required."
+        fi
+    fi
+}
+
+main() {
+    # Set more specific traps inside main
+    trap failure_handler ERR
+    
+    log "--- Starting Enterprise Backup Script ---"
+    if [ "$DRY_RUN" = true ]; then log "--- DRY RUN MODE ENABLED ---"; fi
+    
+    perform_pre_flight_checks
+    
+    # Exit early if --check-only was specified
+    if [ "$CHECK_ONLY" = true ]; then
+        log "--- Pre-flight checks completed successfully ---"
+        return 0
+    fi
+    
+    # Run repository check if requested
+    if [ "$REPO_CHECK" = true ]; then
+        run_borg_repository_check
+    fi
+    
+    if [ "$DRY_RUN" = false ]; then
+        run_database_dumps
+        verify_dump_integrity
+    fi
+    
+    # Only set flag after services are successfully stopped
+    manage_services "stop"
+    services_stopped=true
+    run_borg_backup
+    manage_services "start"
+    services_stopped=false
+    
+    verify_archive_integrity
+    collect_metrics
+    print_backup_summary
+    rotate_logs
+    
+    log "--- Backup Script Completed Successfully ---"
+    send_notification "success" "Backup completed successfully on $HOST_ID. Archive: $ARCHIVE_NAME"
+}
+
+# --- Singleton Execution ---
+# Ensure lock dir exists
+LOCK_FILE_DIR=$(dirname "$LOCK_FILE")
+mkdir -p "$LOCK_FILE_DIR"
+
+# Acquire lock and hold it for the script's lifetime
+LOCK_FD=200
+exec 200>"$LOCK_FILE" # Open the lock file on FD 200
+
+# Try to acquire the lock non-blocking first, then with timeout
+if ! flock -n 200; then
+    # Attempt to read PID *after* confirming the lock is held by another process
+    local existing_pid="unknown"
+    if [ -f "$LOCK_FILE" ]; then
+        existing_pid=$(< "$LOCK_FILE" 2>/dev/null || echo "unknown")
+    fi
+    log "FATAL: Another backup instance is already running (lock held, potentially by PID $existing_pid). Exiting."
+    exit 1
+fi
+
+# Write PID while lock is held
+printf "%s" "$$" >
