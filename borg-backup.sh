@@ -40,7 +40,7 @@ SECRETS_FILE="/root/borg-backup.env"
 LOCK_FILE="/var/run/backup-borg.lock"
 
 # --- Targeted Backup Directories ---
-BACKUP_DIRS=("/etc" "/home" "/var/www" "/var/lib/docker/volumes")
+BACKUP_DIRS=("/")
 
 # --- Services to Manage (Optional fallback) ---
 # NON_DB_SERVICES=() # Leave empty or define fallbacks if needed
@@ -60,6 +60,34 @@ MAX_DEPENDENCY_ITERATIONS=1000  # Safety limit for dependency resolution
 
 # --- Notification Configuration (non-sensitive) ---
 BACKUP_NOTIFY_DISCORD_WEBHOOK=""  # Can be overridden in config file
+
+# --- Backup Exclusions ---
+# Define common system excludes as an array
+# These are paths Borg should *not* traverse or backup
+BORG_EXCLUDES=(
+    --exclude-caches  # Exclude standard cache directories like /home/user/.cache
+    --exclude='/proc'           # Virtual proc filesystem (process info)
+    --exclude='/sys'            # Virtual sys filesystem (device info)
+    --exclude='/dev'            # Device files (not the actual devices)
+    --exclude='/mnt'            # Mount point for other filesystems
+    --exclude='/media'          # Mount point for removable media
+    --exclude='/tmp'            # System-wide temporary files
+    --exclude='/var/tmp'        # Another system-wide temporary location
+    --exclude='/var/run'        # Runtime data (often symlink to /run)
+    --exclude='/var/lock'       # Lock files (often symlink to /run/lock)
+    --exclude='/run'            # Runtime data (sockets, PIDs, etc.)
+    --exclude='/run/*'          # Contents of /run (more specific)
+    --exclude='/lost+found'     # Filesystem metadata directory (usually at root)
+    --exclude='/var/lib/docker' # Docker's state (images, containers, networks, etc.) - STATELESS APPROACH
+    --exclude='/swapfile'       # The swap file (if using one, adjust path if different)
+    --exclude='/home/*/.npm'    # Common user-specific package cache (generic path)
+    --exclude='/home/*/.vscode-server' # Common user-specific editor data (generic path)
+    --exclude='/home/*/snap'    # Snap packages per user
+    --exclude='/home/*/.cache/*' # Generic user cache directories (optional, can be large)
+    --exclude='/var/cache'      # System-wide cache (optional, can be large, but often reproducible)
+    --exclude='/var/log/*'      # System logs (optional, often large, but potentially useful for debugging history)
+    --exclude='/home/*/.local/share/Trash' # User trash 
+)
 
 ################################################################################
 # SCRIPT INITIALIZATION
@@ -322,6 +350,7 @@ show_help() {
     echo "  --help       Display this help message."
     echo "Configuration is loaded from $CONFIG_FILE if it exists."
     echo "Secrets are loaded from $SECRETS_FILE."
+    echo "Backup includes root filesystem with comprehensive exclusions."
 }
 
 DRY_RUN=false
@@ -604,7 +633,7 @@ verify_service_status() {
 }
 
 run_borg_backup() {
-    log "Starting Borg backup..."
+    log "Starting Borg backup of root filesystem..."
     local BORG_DRY_RUN_OPTS=()
     if [ "$DRY_RUN" = true ]; then
         BORG_DRY_RUN_OPTS=(--dry-run --list)
@@ -617,12 +646,19 @@ run_borg_backup() {
         error_exit "BORG_REPO exists but is not a valid Borg repository"
     fi
 
-    # Build borg command array
-    local borg_args=("${RESOURCE_NICE_CMD[@]}" borg create --stats --one-file-system --compression "$BORG_COMPRESSION" \
-      "${BORG_DRY_RUN_OPTS[@]}" --exclude-caches --exclude "$STAGING_DIR" --exclude "*.tmp" --exclude "*.cache" \
-      --exclude "*.log" "$BORG_REPO::$ARCHIVE_NAME")
+    # Build borg command array with comprehensive exclusions
+    local borg_args=(
+        "${RESOURCE_NICE_CMD[@]}" 
+        borg create 
+        --stats 
+        --one-file-system 
+        --compression "$BORG_COMPRESSION" 
+        "${BORG_DRY_RUN_OPTS[@]}"
+        "${BORG_EXCLUDES[@]}"
+        "$BORG_REPO::$ARCHIVE_NAME"
+    )
     
-    # Append backup dirs
+    # Append backup dirs (just root in this case)
     borg_args+=("${BACKUP_DIRS[@]}")
     
     # Append DB dump dir only if it was created and exists
@@ -688,16 +724,10 @@ verify_archive_integrity() {
     local canary_files=()
     
     # Add some common canary files to check
-    for dir in "${BACKUP_DIRS[@]}"; do
-        if [ -d "$dir" ]; then
-            # Look for common important files
-            for pattern in "passwd" "group" "shadow" "hostname"; do
-                local canary; canary=$(find "$dir" -name "$pattern" 2>/dev/null | head -n 1)
-                if [ -n "$canary" ]; then
-                    canary_files+=("$canary")
-                    break
-                fi
-            done
+    for pattern in "etc/passwd" "etc/group" "etc/hostname"; do
+        local canary; canary=$(find "/" -name "$pattern" 2>/dev/null | head -n 1)
+        if [ -n "$canary" ]; then
+            canary_files+=("$canary")
         fi
     done
     
@@ -764,7 +794,7 @@ collect_metrics() {
 print_backup_summary() {
     log "Backup summary:"
     log "  - Archive name: $ARCHIVE_NAME"
-    log "  - Backup directories: ${BACKUP_DIRS[*]}"
+    log "  - Backup scope: Root filesystem with comprehensive exclusions"
     if [ "$DUMPS_CREATED" = true ]; then
         log "  - Database dumps included: $DB_DUMP_DIR"
     else
