@@ -69,7 +69,7 @@ DUMPS_CREATED=false
 PROGRESS_PID=""
 DB_DUMP_DIR=""
 SERVICES_TO_STOP=()
-declare -a STOPPED_BY_SCRIPT=()
+STOPPED_BY_SCRIPT=()
 
 ################################################################################
 # COMMAND-LINE ARGUMENT PARSING
@@ -220,8 +220,8 @@ if ! flock -n 200; then
     fi
 fi
 
-# Write current PID to the lock file
-printf "%s" "$$" > "$LOCK_FILE"
+# Write current PID to the lock file - do this atomically
+printf "%s" "$$" > "$LOCK_FILE" || error_exit "Failed to write PID to lock file"
 chmod 600 "$LOCK_FILE"
 
 # Set traps and execute main function

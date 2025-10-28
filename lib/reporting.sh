@@ -1,4 +1,3 @@
-#!/bin/bash
 #
 # borg-backup - Reporting and Advanced Integrity Functions
 #
@@ -93,6 +92,10 @@ print_backup_summary() {
 # Deletes old log and metric files based on LOG_RETENTION_DAYS
 rotate_logs() {
     log "Rotating logs older than $LOG_RETENTION_DAYS days..."
-    find "$LOG_DIR" -name "bootstrap_*.log" -mtime "+$LOG_RETENTION_DAYS" -delete
-    find "$LOG_DIR" -name "metrics_*.json" -mtime "+$LOG_RETENTION_DAYS" -delete
+    if [ -d "$LOG_DIR" ]; then
+        find "$LOG_DIR" -name "bootstrap_*.log" -mtime "+$LOG_RETENTION_DAYS" -delete 2>/dev/null || log "Warning: Failed to delete some bootstrap logs"
+        find "$LOG_DIR" -name "metrics_*.json" -mtime "+$LOG_RETENTION_DAYS" -delete 2>/dev/null || log "Warning: Failed to delete some metrics files"
+    else
+        log "Log directory does not exist, skipping rotation: $LOG_DIR"
+    fi
 }

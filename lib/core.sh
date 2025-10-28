@@ -1,4 +1,3 @@
-#!/bin/bash
 #
 # borg-backup - Core Backup Functions
 #
@@ -35,8 +34,28 @@ run_database_dumps() {
 verify_dump_integrity() {
     if [ "$DRY_RUN" = true ] || [ "$DUMPS_CREATED" = false ]; then return; fi
     log "Verifying integrity of database dumps..."
+    local dump_file
     for dump_file in "$DB_DUMP_DIR"/*.sql.gz; do
-        [ -f "$dump_file" ] && ! gzip -t "$dump_file" && error_exit "Dump file $dump_file is corrupted."
+        if [ -f "$dump_file" ]; then
+            # Check gzip integrity
+            if ! gzip -t "$dump_file"; then
+                error_exit "Dump file $dump_file is corrupted (gzip test failed)."
+            fi
+            # For SQL dumps, check if they contain SQL content (basic check)
+            if [[ "$dump_file" == *mariadb* ]] || [[ "$dump_file" == *mysql* ]]; then
+                local sample_content
+                sample_content=$(zcat "$dump_file" | head -n 20 | grep -i "dump\|create\|insert\|database" | head -c 100)
+                if [ -z "$sample_content" ]; then
+                    log "WARNING: MySQL dump $dump_file appears to have no SQL content"
+                fi
+            elif [[ "$dump_file" == *postgres* ]]; then
+                local sample_content
+                sample_content=$(zcat "$dump_file" | head -n 20 | grep -i "dump\|create\|insert\|database" | head -c 100)
+                if [ -z "$sample_content" ]; then
+                    log "WARNING: PostgreSQL dump $dump_file appears to have no SQL content"
+                fi
+            fi
+        fi
     done
     log "Dump integrity verified."
 }
@@ -48,7 +67,27 @@ manage_services() {
         log "Zero-downtime mode: No services to $action."
         return 0
     fi
-    # The logic for stopping/starting services would go here if this feature is re-enabled.
+    
+    local svc
+    for svc in "${SERVICES_TO_STOP[@]}"; do
+        log "Attempting to $action service: $svc"
+        if docker_compose_cmd ps --services | grep -Fxq "$svc"; then
+            if docker_compose_cmd ps --filter "status=running" | grep -q "$svc"; then
+                if [ "$action" = "stop" ]; then
+                    docker_compose_cmd stop "$svc" || error_exit "Failed to stop service $svc"
+                    verify_service_status "$svc" "exited" || error_exit "Service $svc did not stop in time"
+                    STOPPED_BY_SCRIPT+=("$svc")
+                elif [ "$action" = "start" ]; then
+                    docker_compose_cmd start "$svc" || error_exit "Failed to start service $svc"
+                    verify_service_status "$svc" "running" || error_exit "Service $svc did not start in time"
+                fi
+            elif [ "$action" = "start" ]; then
+                log "Service $svc was not running, no need to start"
+            fi
+        else
+            log "WARNING: Service $svc not found in compose file"
+        fi
+    done
 }
 
 # Waits for a Docker service to reach an expected status (e.g., 'running' or 'exited')
@@ -70,9 +109,16 @@ run_borg_backup() {
     if [ "$DRY_RUN" = true ]; then BORG_DRY_RUN_OPTS=(--dry-run); fi
     
     if [ "$DRY_RUN" = false ] && [ ! -d "$BORG_REPO" ]; then
-        log "Initializing Borg repo at $BORG_REPO..."
-        mkdir -p "$(dirname "$BORG_REPO")"
-        borg init --encryption=repokey-blake2 "$BORG_REPO"
+        log "Borg repository does not exist. Creating at $BORG_REPO..."
+        # Safety check: ensure we're not creating repo in a system directory
+        local repo_parent; repo_parent=$(dirname "$BORG_REPO")
+        if [ "$repo_parent" = "/" ] || [ "$repo_parent" = "/root" ] || [ "$repo_parent" = "/home" ]; then
+            error_exit "Safety check failed: Attempting to create repository in potentially dangerous location: $BORG_REPO"
+        fi
+        
+        mkdir -p "$(dirname "$BORG_REPO")" || error_exit "Failed to create parent directory for repository"
+        borg init --encryption=repokey-blake2 "$BORG_REPO" || error_exit "Failed to initialize Borg repository"
+        log "Borg repository initialized successfully"
     fi
 
     # Build the borg command with all options
@@ -95,7 +141,7 @@ run_borg_backup() {
     if [ "$NO_PRUNE" = false ]; then
         if [ "$DRY_RUN" = false ]; then
             start_progress "Pruning old archives"
-            "${RESOURCE_NICE_CMD[@]}" borg prune -v --list "$BORG_REPO" --keep-daily="$RETENTION_DAYS"
+            "${RESOURCE_NICE_CMD[@]}" borg prune -v --list "$BORG_REPO" --keep-daily="$RETENTION_DAYS" || error_exit "Borg prune failed"
             stop_progress
         else
             log "DRY RUN: Would prune archives (keeping $RETENTION_DAYS daily)"

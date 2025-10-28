@@ -1,4 +1,3 @@
-#!/bin/bash
 #
 # borg-backup - Pre-flight Check Functions
 #
@@ -33,13 +32,22 @@ validate_configuration() {
 }
 
 # Verifies secrets file permissions and securely loads DB credentials
-validate_secrets_file() {
+alidate_secrets_file() {
     # Secrets file permissions must be 600 and owned by root
-    if [ "$(stat -c "%a" "$SECRETS_FILE")" -ne 600 ] || [ "$(stat -c "%U" "$SECRETS_FILE")" != "root" ]; then
-        error_exit "Secrets file ($SECRETS_FILE) must be owned by root with 600 permissions"
+    if [ ! -f "$SECRETS_FILE" ]; then
+        error_exit "Secrets file does not exist: $SECRETS_FILE"
     fi
+    
+    local perms; perms=$(stat -c "%a" "$SECRETS_FILE" 2>/dev/null)
+    local owner; owner=$(stat -c "%U" "$SECRETS_FILE" 2>/dev/null)
+    
+    if [ "$perms" != "600" ] || [ "$owner" != "root" ]; then
+        error_exit "Secrets file ($SECRETS_FILE) must be owned by root with 600 permissions (current: $owner:$perms)"
+    fi
+    
     # Securely load database secrets into non-exported variables and unset the originals
     local db_secrets=("MYSQL_ROOT_PASSWORD" "POSTGRES_PASSWORD" "POSTGRES_USER")
+    local secret
     for secret in "${db_secrets[@]}"; do
         if [ -n "${!secret:-}" ]; then
             declare -g "SECURE_$secret=${!secret}"
@@ -73,11 +81,22 @@ handle_borg_lock() {
     fi
 }
 
+validate_docker_services() {
+    log "Validating Docker Compose services..."
+    if [ -f "$DOCKER_COMPOSE_FILE" ]; then
+        # Check if compose file is valid
+        if ! docker_compose_cmd config --quiet 2>/dev/null; then
+            error_exit "Docker Compose file is invalid: $DOCKER_COMPOSE_FILE"
+        fi
+    fi
+}
+
 # Master function to run all pre-flight checks
 perform_pre_flight_checks() {
     check_dependencies
     validate_configuration
     validate_secrets_file
+    validate_docker_services
     check_system_health
     handle_borg_lock
     if [ -d "$BORG_REPO" ]; then

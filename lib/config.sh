@@ -1,4 +1,3 @@
-#!/bin/bash
 #
 # borg-backup - Default Configuration
 # These values can be overridden in a 'borg-backup.conf' file in the same directory as the main script.

@@ -1,4 +1,3 @@
-#!/bin/bash
 #
 # borg-backup - Utility Functions
 #
