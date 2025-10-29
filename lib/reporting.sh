@@ -190,36 +190,62 @@ _verify_spot_checks() {
 
 # --- Other Reporting and Maintenance Functions ---
 
-# Finds and checks the application-level integrity of any SQLite databases in the backup
+# Finds and checks the application-level integrity of any SQLite databases
+# specifically within the Docker application data directory.
 check_backed_up_sqlite_integrity() {
     if [ "$DRY_RUN" = true ]; then return; fi
     log "Checking integrity of SQLite databases in the backup..."
+
+    # --- START: New logic to determine the target search path ---
+
+    # 1. Get the parent directory of the Docker Compose file.
+    local docker_root_dir
+    docker_root_dir=$(dirname "$DOCKER_COMPOSE_FILE")
+
+    # 2. Calculate the path of that directory as it exists inside the archive.
+    local archive_target_path=""
+    for root_dir in "${BACKUP_DIRS[@]}"; do
+        if [[ "$docker_root_dir" == "$root_dir"* ]]; then
+            archive_target_path="${docker_root_dir#$root_dir}"
+            archive_target_path="${archive_target_path#/}"
+            break
+        fi
+    done
+
+    # 3. Safety Check: If the Docker directory isn't in the backup, skip the check.
+    if [ -z "$archive_target_path" ]; then
+        log "Docker compose directory ($docker_root_dir) is not within any BACKUP_DIRS; skipping targeted SQLite check."
+        return 0
+    fi
+
+    log "Targeting SQLite check to archive path: '$archive_target_path'"
+
+    # --- END: New logic ---
+
     local temp_extract_dir
     temp_extract_dir=$(mktemp -d "$STAGING_DIR/tmp_sqlite_XXXXXXXX")
-    trap 'rm -rf "$temp_extract_dir"' RETURN
+    trap "rm -rf '$temp_extract_dir'" RETURN
 
     local sqlite_dbs
-    sqlite_dbs=$(borg_run borg list "$BORG_REPO::$ARCHIVE_NAME" --format '{path}
+    # Modified command: Pass the archive_target_path to 'borg list' to limit the search.
+    sqlite_dbs=$(borg_run borg list "$BORG_REPO::$ARCHIVE_NAME" "$archive_target_path" --format '{path}
 ' | grep -E '\.(db|sqlite|sqlite3)$' || true)
 
     if [ -z "$sqlite_dbs" ]; then
-        log "No SQLite databases found."
-        # The RETURN trap will automatically clean up the temp directory.
+        log "No SQLite databases found in the targeted directory."
         return
     fi
 
     log "Found SQLite databases, starting integrity checks..."
     local check_failed=false
     local db_count=0
-    
     while IFS= read -r db_path; do
         if [ -z "$db_path" ]; then continue; fi
         db_count=$((db_count + 1))
-        
         local safe_basename
         safe_basename=$(basename "$db_path")
         local temp_db_file="$temp_extract_dir/$safe_basename"
-        
+
         log "Checking: $db_path"
         
         # Extract the database file
@@ -229,13 +255,12 @@ check_backed_up_sqlite_integrity() {
             continue
         fi
 
-        # Validate the extracted file is actually a SQLite database
+        # Use the improved "silent skip" logic for non-SQLite files.
         if ! file "$temp_db_file" | grep -q "SQLite"; then
-            log_warn "  WARNING: Extracted file $db_path is not a valid SQLite database"
+            log_debug "  Skipping non-SQLite file: $db_path"
             continue
         fi
 
-        # Check file size (SQLite databases should not be empty)
         if [ ! -s "$temp_db_file" ]; then
             log_warn "  WARNING: SQLite database $db_path is empty"
             check_failed=true
@@ -255,9 +280,7 @@ check_backed_up_sqlite_integrity() {
             done <<< "$integrity_result"
         fi
     done <<< "$sqlite_dbs"
-    
-    # The RETURN trap will automatically clean up the temp directory.
-    
+
     log "SQLite integrity check completed. Checked $db_count database(s)."
     if [ "$check_failed" = true ]; then
         log_warn "One or more SQLite databases failed integrity check"
