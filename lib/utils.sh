@@ -41,53 +41,7 @@ send_notification() {
     fi
 }
 
-# Progress indicator for long-running operations
-start_progress() {
-    local message="$1"
-    local safe_message
-    safe_message=$(printf '%s' "$message" | tr -d '\0\r\n')
-    log "$message"
 
-    if command -v setsid >/dev/null 2>&1; then
-        setsid bash -c '
-            safe_msg="$1"
-            while true; do
-                for c in / - \\ \|; do
-                    printf "\r%s - %s" "$(date +"%Y-%m-%d %H:%M:%S")" "$safe_msg $c"
-                    sleep 0.2
-                done
-            done
-        ' _ "$safe_message" >/dev/null 2>&1 &
-        PROGRESS_PID=$!
-        # capture pgid if possible
-        PROGRESS_PGID=$(ps -o pgid= -p "$PROGRESS_PID" 2>/dev/null | tr -d ' ' || true)
-    else
-        (
-            while true; do
-                for c in / - \\ \|; do
-                    printf "\r%s - %s" "$(date +"%Y-%m-%d %H:%M:%S")" "$safe_message $c"
-                    sleep 0.2
-                done
-            done
-        ) &
-        PROGRESS_PID=$!
-        PROGRESS_PGID=""
-    fi
-}
-
-# Stops the background progress indicator
-stop_progress() {
-    if [ -n "${PROGRESS_PID:-}" ]; then
-        kill "$PROGRESS_PID" 2>/dev/null || true
-        if [ -n "${PROGRESS_PGID:-}" ]; then
-            kill -TERM -"${PROGRESS_PGID}" 2>/dev/null || true
-        fi
-        wait "$PROGRESS_PID" 2>/dev/null || true
-        PROGRESS_PID=""
-        PROGRESS_PGID=""
-        printf "\r\033[K%s - %s\n" "$(date +"%Y-%m-%d %H:%M:%S")" "Operation completed"
-    fi
-}
 
 # Checks if a given PID from a lock file is still running
 check_lock_pid() {

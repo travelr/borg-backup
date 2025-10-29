@@ -76,13 +76,13 @@ validate_secrets_file() {
         error_exit "Secrets file ($SECRETS_FILE) must be owned by root with 600 permissions (current: $owner:$perms)"
     fi
     
-    # Securely load database secrets into non-exported variables and unset the originals
+    # Securely load database secrets into the SECURE_ namespace.
     local db_secrets=("MYSQL_ROOT_PASSWORD" "POSTGRES_PASSWORD" "POSTGRES_USER")
     local secret
     for secret in "${db_secrets[@]}"; do
         if [ -n "${!secret:-}" ]; then
             declare -g "SECURE_$secret=${!secret}"
-            unset "$secret"
+            # The "unset" command has been removed to prevent state corruption.
         fi
     done
 }
@@ -166,8 +166,13 @@ perform_pre_flight_checks() {
     check_system_health
     handle_borg_lock
     if [ -d "$BORG_REPO" ]; then
+        # Temporarily export the passphrase to check repo accessibility.
+        # DO NOT unset it here, as it is needed by the main backup functions later.
         export BORG_PASSPHRASE
-        borg list "$BORG_REPO" >/dev/null 2>&1 || { unset BORG_PASSPHRASE; error_exit "Borg repository exists but is not accessible or cannot be opened."; }
-        unset BORG_PASSPHRASE
+        borg list "$BORG_REPO" >/dev/null 2>&1 || {
+            # It is still good practice to unset on failure before exiting.
+            unset BORG_PASSPHRASE
+            error_exit "Borg repository exists but is not accessible or cannot be opened."
+        }
     fi
 }

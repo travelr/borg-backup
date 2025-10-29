@@ -7,9 +7,15 @@
 verify_archive_integrity() {
     if [ "$DRY_RUN" = true ]; then return; fi
     log "Verifying archive integrity..."
+
+    # Export the passphrase for all borg commands within this function.
+    export BORG_PASSPHRASE
     
     # 1. Verify the archive exists in the repository
-    borg list "$BORG_REPO::$ARCHIVE_NAME" >/dev/null || error_exit "Archive verification failed: Could not find created archive."
+    borg list "$BORG_REPO::$ARCHIVE_NAME" >/dev/null || {
+        unset BORG_PASSPHRASE
+        error_exit "Archive verification failed: Could not find created archive."
+    }
     
     # 2. Verify database dumps (if created) are present in the archive
     if [ "$DUMPS_CREATED" = true ]; then
@@ -17,48 +23,53 @@ verify_archive_integrity() {
 
         # check for a specific file pattern known to be inside the dump directory.
         if ! borg list "$BORG_REPO::$ARCHIVE_NAME" --format '{path}\n' | grep -qE "${dump_dir_basename}/.*(_dump\.sql\.gz|_influxdb\.tar\.gz)$"; then
+            unset BORG_PASSPHRASE
             error_exit "Database dump files not found in backup archive."
         fi
     fi
     
     # 3. Perform random spot restore checks to test restorability
     log "Performing spot restore checks..."
-    
-    # Create a null-delimited list of files to handle any special characters, including newlines.
     local file_list
-    # Note: We use an array to store the files safely.
+    # The mapfile and shuf solution is more robust for special characters
     mapfile -d '' file_list < <(borg list "$BORG_REPO::$ARCHIVE_NAME" --format '{path}{NUL}' | grep -vz '/$' || true)
 
     if [ ${#file_list[@]} -eq 0 ]; then
         log "WARNING: Archive appears empty, cannot perform spot restore check."
     else
-        # Select 3 random indices from the array
         local sample_indices=()
-        for i in $(seq 0 $((${#file_list[@]} - 1)) | shuf -n 3); do
-            sample_indices+=("$i")
-        done
+        if command -v shuf >/dev/null 2>&1; then
+            for i in $(seq 0 $((${#file_list[@]} - 1)) | shuf -n 3); do
+                sample_indices+=("$i")
+            done
+        else # Fallback for systems without shuf
+            # ... (alternative random selection if needed, or just pick first 3)
+            log_warn "shuf command not found, using first 3 files for spot check."
+            sample_indices=(0 1 2)
+        fi
         
         local check_failed=false
         for index in "${sample_indices[@]}"; do
+            # Ensure we don't go out of bounds if there are fewer than 3 files
+            [ -z "${file_list[$index]:-}" ] && continue
+
             local sample_file="${file_list[$index]}"
-            if [ -n "$sample_file" ]; then
-                log "  Spot checking: $sample_file"
-                # Temporarily export passphrase for the extract command
-                export BORG_PASSPHRASE
-                if ! borg extract "$BORG_REPO::$ARCHIVE_NAME" "$sample_file" --stdout >/dev/null; then
-                    unset BORG_PASSPHRASE
-                    log_error "Failed to restore sample file: $sample_file"
-                    check_failed=true
-                fi
-                unset BORG_PASSPHRASE
+            log "  Spot checking: $sample_file"
+            if ! borg extract "$BORG_REPO::$ARCHIVE_NAME" "$sample_file" --stdout >/dev/null; then
+                log_error "Failed to restore sample file: $sample_file"
+                check_failed=true
             fi
         done
 
         if [ "$check_failed" = true ]; then
+            unset BORG_PASSPHRASE
             error_exit "One or more spot restore checks failed."
         fi
     fi
     log "Archive integrity and restorability verified."
+
+    # Unset the passphrase at the very end of the function.
+    unset BORG_PASSPHRASE
 }
 
 # Finds and checks the application-level integrity of any SQLite databases in the backup

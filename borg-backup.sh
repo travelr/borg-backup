@@ -188,7 +188,7 @@ on_exit() {
     # close fd 200 if open
     exec 200>&- 2>/dev/null || true
 
-    if [ -n "${PROGRESS_PID:-}" ]; then stop_progress; fi
+   
 
     # On failure (non-zero exit code), attempt an emergency restart of services
     if [ "$exit_code" -ne 0 ]; then
@@ -222,7 +222,6 @@ on_exit() {
 failure_handler() {
    local line_number=$1
     log "A failure occurred at line $line_number. Executing failure handler..."
-    if [ -n "${PROGRESS_PID:-}" ]; then stop_progress; fi
 
     if [ "$DRY_RUN" = false ]; then
         log_warn "The backup for archive '$ARCHIVE_NAME' may be incomplete due to the error."
