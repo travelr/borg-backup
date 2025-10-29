@@ -1,3 +1,4 @@
+#!/bin/bash
 #
 # borg-backup - Reporting and Advanced Integrity Functions
 #
@@ -13,19 +14,50 @@ verify_archive_integrity() {
     # 2. Verify database dumps (if created) are present in the archive
     if [ "$DUMPS_CREATED" = true ]; then
         local dump_dir_basename; dump_dir_basename=$(basename "$DB_DUMP_DIR")
-        borg list "$BORG_REPO::$ARCHIVE_NAME" | grep -q "$dump_dir_basename" || error_exit "Database dump directory not in backup"
+
+        # check for a specific file pattern known to be inside the dump directory.
+        if ! borg list "$BORG_REPO::$ARCHIVE_NAME" --format '{path}\n' | grep -qE "${dump_dir_basename}/.*(_dump\.sql\.gz|_influxdb\.tar\.gz)$"; then
+            error_exit "Database dump files not found in backup archive."
+        fi
     fi
     
     # 3. Perform random spot restore checks to test restorability
     log "Performing spot restore checks..."
-    for i in {1..3}; do
-        local sample_file; sample_file=$(borg list "$BORG_REPO::$ARCHIVE_NAME" --format '{path}\n' | grep -v '/$' | shuf -n 1)
-        if [ -n "$sample_file" ]; then
-            borg extract "$BORG_REPO::$ARCHIVE_NAME" "$sample_file" --stdout >/dev/null || error_exit "Failed to restore sample file: $sample_file"
-        else
-            log "WARNING: Archive appears empty, cannot perform spot restore check."; break
+    
+    # Create a null-delimited list of files to handle any special characters, including newlines.
+    local file_list
+    # Note: We use an array to store the files safely.
+    mapfile -d '' file_list < <(borg list "$BORG_REPO::$ARCHIVE_NAME" --format '{path}{NUL}' | grep -vz '/$' || true)
+
+    if [ ${#file_list[@]} -eq 0 ]; then
+        log "WARNING: Archive appears empty, cannot perform spot restore check."
+    else
+        # Select 3 random indices from the array
+        local sample_indices=()
+        for i in $(seq 0 $((${#file_list[@]} - 1)) | shuf -n 3); do
+            sample_indices+=("$i")
+        done
+        
+        local check_failed=false
+        for index in "${sample_indices[@]}"; do
+            local sample_file="${file_list[$index]}"
+            if [ -n "$sample_file" ]; then
+                log "  Spot checking: $sample_file"
+                # Temporarily export passphrase for the extract command
+                export BORG_PASSPHRASE
+                if ! borg extract "$BORG_REPO::$ARCHIVE_NAME" "$sample_file" --stdout >/dev/null; then
+                    unset BORG_PASSPHRASE
+                    log_error "Failed to restore sample file: $sample_file"
+                    check_failed=true
+                fi
+                unset BORG_PASSPHRASE
+            fi
+        done
+
+        if [ "$check_failed" = true ]; then
+            error_exit "One or more spot restore checks failed."
         fi
-    done
+    fi
     log "Archive integrity and restorability verified."
 }
 
@@ -34,33 +66,77 @@ check_backed_up_sqlite_integrity() {
     if [ "$DRY_RUN" = true ]; then return; fi
     log "Checking integrity of SQLite databases in the backup..."
     
-    local temp_extract_dir; temp_extract_dir=$(mktemp -d "$STAGING_DIR/tmp_sqlite_XXXXXXXX")
-    # Ensure the temp directory is cleaned up when the function returns
-    trap 'rm -rf "$temp_extract_dir"' RETURN
+    local temp_extract_dir
+    temp_extract_dir=$(mktemp -d "$STAGING_DIR/tmp_sqlite_XXXXXXXX")
+    # Ensure the temp directory is cleaned up when the function exits or returns.
+    # The RETURN trap is perfect for function-local cleanup.
+    cleanup_temp_dir() {
+        rm -rf "$temp_extract_dir"
+    }
+    trap cleanup_temp_dir RETURN
 
-    local sqlite_dbs; sqlite_dbs=$(borg list "$BORG_REPO::$ARCHIVE_NAME" --format '{path}\n' | grep -E '\.(db|sqlite|sqlite3)$' || true)
-    if [ -z "$sqlite_dbs" ]; then log "No SQLite databases found."; return; fi
+    local sqlite_dbs
+    sqlite_dbs=$(borg list "$BORG_REPO::$ARCHIVE_NAME" --format '{path}\n' | grep -E '\.(db|sqlite|sqlite3)$' || true)
+    if [ -z "$sqlite_dbs" ]; then 
+        log "No SQLite databases found."
+        # The RETURN trap will automatically clean up the temp directory.
+        return
+    fi
 
     log "Found SQLite databases, starting integrity checks..."
     local check_failed=false
+    local db_count=0
+    
     while IFS= read -r db_path; do
         if [ -z "$db_path" ]; then continue; fi
-        local safe_basename; safe_basename=$(basename "$db_path")
+        db_count=$((db_count + 1))
+        
+        local safe_basename
+        safe_basename=$(basename "$db_path")
         local temp_db_file="$temp_extract_dir/$safe_basename"
+        
         log "Checking: $db_path"
         
+        # Extract the database file
         if ! borg extract "$BORG_REPO::$ARCHIVE_NAME" "$db_path" --stdout > "$temp_db_file"; then
-            log "  ERROR: Failed to extract $db_path"; check_failed=true; continue
+            log_error "  ERROR: Failed to extract $db_path"
+            check_failed=true
+            continue
         fi
 
-        local integrity_result; integrity_result=$(sqlite3 "$temp_db_file" "PRAGMA integrity_check;" 2>&1)
+        # Validate the extracted file is actually a SQLite database
+        if ! file "$temp_db_file" | grep -q "SQLite"; then
+            log_warn "  WARNING: Extracted file $db_path is not a valid SQLite database"
+            continue
+        fi
+
+        # Check file size (SQLite databases should not be empty)
+        if [ ! -s "$temp_db_file" ]; then
+            log_warn "  WARNING: SQLite database $db_path is empty"
+            check_failed=true
+            continue
+        fi
+
+        # Perform integrity check
+        local integrity_result
+        integrity_result=$(sqlite3 "$temp_db_file" "PRAGMA integrity_check;" 2>&1)
         if [[ "$integrity_result" == "ok" ]]; then
             log "  OK: Integrity verified for $db_path"
         else
-            log "  WARNING: Integrity check FAILED for $db_path"; check_failed=true
-            while IFS= read -r line; do log "    SQLite Error: $line"; done <<< "$integrity_result"
+            log_error "  WARNING: Integrity check FAILED for $db_path"
+            check_failed=true
+            while IFS= read -r line; do 
+                log "    SQLite Error: $line"
+            done <<< "$integrity_result"
         fi
     done <<< "$sqlite_dbs"
+    
+    # The RETURN trap will automatically clean up the temp directory.
+    
+    log "SQLite integrity check completed. Checked $db_count database(s)."
+    if [ "$check_failed" = true ]; then
+        log "WARNING: One or more SQLite databases failed integrity check"
+    fi
 }
 
 # Collects statistics about the backup and saves them to a JSON file
@@ -73,11 +149,12 @@ collect_metrics() {
     local compressed_size; compressed_size=$(echo "$archive_info" | jq -r '.archives[0].stats.compressed_size // 0')
     local duration=$(( $(date +%s) - START_TIME ))
     
+    # Use '|| true' on jq to prevent script exit if jq fails for some reason, though it shouldn't.
     jq -n \
         --arg timestamp "$TIMESTAMP" --arg archive_name "$ARCHIVE_NAME" \
         --argjson archive_size "$archive_size" --argjson compressed_size "$compressed_size" \
         --argjson duration "$duration" \
-        '{ timestamp: $timestamp, archive_name: $archive_name, archive_size: $archive_size, compressed_size: $compressed_size, duration: $duration }' > "$metrics_file"
+        '{ timestamp: $timestamp, archive_name: $archive_name, archive_size: $archive_size, compressed_size: $compressed_size, duration: $duration }' > "$metrics_file" || error_exit "Failed to write metrics file."
     log "Metrics collected: $metrics_file"
 }
 
@@ -93,8 +170,9 @@ print_backup_summary() {
 rotate_logs() {
     log "Rotating logs older than $LOG_RETENTION_DAYS days..."
     if [ -d "$LOG_DIR" ]; then
-        find "$LOG_DIR" -name "bootstrap_*.log" -mtime "+$LOG_RETENTION_DAYS" -delete 2>/dev/null || log "Warning: Failed to delete some bootstrap logs"
-        find "$LOG_DIR" -name "metrics_*.json" -mtime "+$LOG_RETENTION_DAYS" -delete 2>/dev/null || log "Warning: Failed to delete some metrics files"
+        # Using -delete is efficient, but we add a warning in case it fails.
+        find "$LOG_DIR" -name "bootstrap_*.log" -mtime "+$LOG_RETENTION_DAYS" -delete 2>/dev/null || log_warn "Failed to delete some old bootstrap logs"
+        find "$LOG_DIR" -name "metrics_*.json" -mtime "+$LOG_RETENTION_DAYS" -delete 2>/dev/null || log_warn "Failed to delete some old metrics files"
     else
         log "Log directory does not exist, skipping rotation: $LOG_DIR"
     fi

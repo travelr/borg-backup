@@ -16,15 +16,68 @@ set -E
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# NOTE: Docker compose detection is deferred to docker_compose_cmd() in lib/utils.sh
+# to avoid calling error_exit before utils.sh is sourced.
+
+LOG_FILE="/tmp/borg-backup-early-$$.log"
+touch "$LOG_FILE"
+chmod 600 "$LOG_FILE"
+
 # Source all library files. The order is important.
-source "$SCRIPT_DIR/lib/config.sh"
 source "$SCRIPT_DIR/lib/utils.sh"
+source "$SCRIPT_DIR/lib/config.sh"
 source "$SCRIPT_DIR/lib/checks.sh"
 source "$SCRIPT_DIR/lib/core.sh"
 source "$SCRIPT_DIR/lib/reporting.sh"
 
 # Secure file creation defaults
 umask 077
+
+# --- Load External User Configuration (MANDATORY) ---
+CONFIG_FILE="$SCRIPT_DIR/borg-backup.conf"
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "FATAL: Configuration file not found at $CONFIG_FILE" >&2
+    echo "Please create the configuration file with your settings." >&2
+    exit 1
+fi
+
+log "Loading configuration from $CONFIG_FILE"
+if ! bash -n "$CONFIG_FILE" 2>/dev/null; then
+    error_exit "Configuration file $CONFIG_FILE contains syntax errors"
+fi
+
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+
+# Validate required configuration is present
+required_vars=("STAGING_DIR" "BORG_REPO")
+for var in "${required_vars[@]}"; do
+    if [ -z "${!var:-}" ]; then
+        error_exit "Required configuration variable $var must be set in $CONFIG_FILE"
+    fi
+done
+
+# FIX: BACKUP_DIRS must be a non-empty array. If it's empty, borg create will fail.
+if [ ${#BACKUP_DIRS[@]} -eq 0 ]; then
+    error_exit "BACKUP_DIRS must be set to at least one directory in $CONFIG_FILE"
+fi
+
+# Set DOCKER_COMPOSE_FILE to default if not provided
+if [ -z "${DOCKER_COMPOSE_FILE:-}" ]; then
+    DOCKER_COMPOSE_FILE="/opt/docker-compose.yml"
+    log "DOCKER_COMPOSE_FILE not specified, using default: $DOCKER_COMPOSE_FILE"
+fi
+
+# Ensure SECRETS_FILE is absolute path if it's not already
+if [[ "$SECRETS_FILE" != /* ]]; then
+    SECRETS_FILE="$SCRIPT_DIR/$SECRETS_FILE"
+fi
+
+# Set LOCK_FILE to default if not provided
+if [ -z "${LOCK_FILE:-}" ]; then
+    LOCK_FILE="/var/run/backup-borg.lock"
+    log "LOCK_FILE not specified, using default: $LOCK_FILE"
+fi
 
 # --- Early runtime variables (needed for logging/error handling during parsing) ---
 START_TIME=$(date +%s)
@@ -37,22 +90,12 @@ mkdir -p "$STAGING_DIR"
 LOG_DIR="$STAGING_DIR/logs"
 mkdir -p "$LOG_DIR"
 
-# Bootstrap log file
+# FIX: Re-assign LOG_FILE to its final, persistent location now that the directory exists.
 LOG_FILE="$LOG_DIR/bootstrap_${TIMESTAMP}.log"
 touch "$LOG_FILE"
 chmod 600 "$LOG_FILE"
 
 log "Script started. Loading configuration and secrets..."
-
-# --- Load External User Configuration (overrides defaults from lib/config.sh) ---
-CONFIG_FILE="$SCRIPT_DIR/borg-backup.conf"
-if [ -f "$CONFIG_FILE" ]; then
-    log "Loading configuration from $CONFIG_FILE"
-    # shellcheck source=/dev/null
-    source "$CONFIG_FILE"
-else
-    log "No configuration file found at $CONFIG_FILE, using defaults"
-fi
 
 # --- Load Secrets (sensitive credentials only) ---
 if [ -f "$SECRETS_FILE" ]; then
@@ -67,6 +110,7 @@ fi
 # Initialize global state variables
 DUMPS_CREATED=false
 PROGRESS_PID=""
+PROGRESS_PGID=""
 DB_DUMP_DIR=""
 SERVICES_TO_STOP=()
 STOPPED_BY_SCRIPT=()
@@ -80,6 +124,7 @@ CHECK_ONLY=false
 NO_PRUNE=false
 REPO_CHECK=false
 CHECK_SQLITE=false
+DEBUG=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -88,11 +133,15 @@ while [[ $# -gt 0 ]]; do
         --no-prune) NO_PRUNE=true ;;
         --repo-check) REPO_CHECK=true ;;
         --check-sqlite) CHECK_SQLITE=true ;;
+        --debug) DEBUG=true ;;
         --help) show_help && exit 0 ;;
-        *) log "FATAL: Unknown option: $1"; exit 1 ;;
+        *) error_exit "Unknown option: $1" ;;
     esac
     shift
 done
+
+# Export DEBUG for use in library functions
+export DEBUG
 
 # --- Final Variable Setup ---
 RESOURCE_NICE_CMD=(ionice -c2 -n7 nice -n10)
@@ -102,7 +151,6 @@ if [ -z "${BORG_PASSPHRASE:-}" ]; then
     log "FATAL: BORG_PASSPHRASE must be set in $SECRETS_FILE"
     exit 1
 fi
-export BORG_PASSPHRASE
 
 ################################################################################
 # MAIN EXECUTION & TRAP HANDLING
@@ -110,60 +158,81 @@ export BORG_PASSPHRASE
 
 # cleanup is called by the EXIT trap
 cleanup() {
-    local end_time=$(date +%s); local duration=$((end_time - START_TIME))
+    local end_time duration
+    end_time=$(date +%s)
+    duration=$((end_time - START_TIME))
     if [ "$DRY_RUN" = false ]; then
         if [ -n "${DB_DUMP_DIR:-}" ] && [ -d "$DB_DUMP_DIR" ]; then
             log "Cleaning up temporary dump directory..."
             rm -rf "$DB_DUMP_DIR"
         fi
     fi
+
     log "Script execution time: $duration seconds."
 }
 
 # on_exit is the master trap handler for script completion or interrupt
 on_exit() {
     local exit_code=$?
-    # Always release the lock first
-    rm -f "$LOCK_FILE" 2>/dev/null
-    exec 200>&- 2>/dev/null
+
+    # Only remove lock file if we are the owner
+    if [ -f "$LOCK_FILE" ]; then
+        lock_pid=$(cat "$LOCK_FILE" 2>/dev/null || echo "")
+        if [ "$lock_pid" = "$$" ]; then
+            rm -f "$LOCK_FILE" 2>/dev/null || true
+        else
+            log "Not removing lock file ($LOCK_FILE) — owned by PID $lock_pid"
+        fi
+    fi
+
+    # close fd 200 if open
+    exec 200>&- 2>/dev/null || true
 
     if [ -n "${PROGRESS_PID:-}" ]; then stop_progress; fi
-    
-    # Emergency restart of any services this script may have stopped
-    local any_stopped=false
-    for svc in "${STOPPED_BY_SCRIPT[@]}"; do
-        if docker_compose_cmd ps --services --filter "status=exited" | grep -Fxq "$svc"; then
-            any_stopped=true
-            break
-        fi
-    done
 
-    if [ "$any_stopped" = "true" ]; then
-        log "Recovery: Found stopped services, attempting to restart them due to script exit..."
-        set +e # Prevent trap from exiting if restart fails
-        ( manage_services "start" )
-        set -e
+    # On failure (non-zero exit code), attempt an emergency restart of services
+    if [ "$exit_code" -ne 0 ]; then
+        local any_stopped=false
+        # Get a list of currently running services just once.
+        local running_services
+        running_services=$(docker_compose_cmd ps --services --filter "status=running")
+
+        # Check each service that this script was supposed to have stopped.
+        for svc in "${STOPPED_BY_SCRIPT[@]}"; do
+            # If the service is NOT in the list of running services, we need to restart.
+            if ! echo "$running_services" | grep -Fxq "$svc"; then
+                any_stopped=true
+                break
+            fi
+        done
+
+        if [ "$any_stopped" = "true" ]; then
+            log "Recovery: Found stopped services, attempting to restart them due to script exit (code: $exit_code)..."
+            set +e # Prevent trap from exiting if restart fails
+            ( manage_services "start" )
+            set -e
+        fi
     fi
-    
+
     cleanup
     log "Exited with status $exit_code."
 }
 
 # failure_handler is called by the ERR trap on any command failure
 failure_handler() {
-    log "A failure occurred. Executing failure handler..."
+   local line_number=$1
+    log "A failure occurred at line $line_number. Executing failure handler..."
     if [ -n "${PROGRESS_PID:-}" ]; then stop_progress; fi
-    
-    if [ "$DRY_RUN" = false ] && command -v borg >/dev/null 2>&1; then
-        log "Cleaning up potentially failed backup archive: $ARCHIVE_NAME"
-        # This may fail if the repo is locked or the archive doesn't exist, so we suppress errors
-        borg delete "$BORG_REPO::$ARCHIVE_NAME" 2>/dev/null || true
+
+    if [ "$DRY_RUN" = false ]; then
+        log_warn "The backup for archive '$ARCHIVE_NAME' may be incomplete due to the error."
+        log_warn "It will NOT be deleted automatically. Manual inspection of the repository is recommended."
     fi
 }
 
 # The main logic flow of the script
 main() {
-    trap failure_handler ERR
+    trap 'failure_handler $LINENO' ERR
 
     log "--- Starting Borg Backup Script ---"
     if [ "$DRY_RUN" = true ]; then log "--- DRY RUN MODE ENABLED ---"; fi
@@ -183,7 +252,6 @@ main() {
 
     if [ "$DRY_RUN" = false ]; then
         run_database_dumps
-        verify_dump_integrity
     fi
 
     run_borg_backup
@@ -204,26 +272,36 @@ main() {
 
 # --- Singleton Execution Lock ---
 LOCK_FILE_DIR=$(dirname "$LOCK_FILE")
-mkdir -p "$LOCK_FILE_DIR"
-exec 200>"$LOCK_FILE"
+mkdir -p "$LOCK_FILE_DIR" || error_exit "Failed to create lock file directory $LOCK_FILE_DIR"
 
+# Open the lock file descriptor (create if missing)
+exec 200>"$LOCK_FILE" || error_exit "Failed to open lock file $LOCK_FILE"
+
+# Try to get the lock non-blocking
 if ! flock -n 200; then
-    existing_pid=$(< "$LOCK_FILE" 2>/dev/null || echo "unknown")
+    # Read the PID from the lock file. A simple cat is sufficient.
+    existing_pid=$(cat "$LOCK_FILE" 2>/dev/null || echo "unknown")
+
     if check_lock_pid "$existing_pid"; then
         log "FATAL: Another backup instance is already running (PID $existing_pid). Exiting."
         exit 1
     else
-        log "Found stale lock file with PID $existing_pid, attempting to take over."
-        # Truncate file and re-acquire lock
-        exec 200>"$LOCK_FILE"
-        flock -n 200 || error_exit "Could not acquire lock after removing stale lock."
+        log "Stale lock detected (PID: $existing_pid). Attempting takeover..."
+        rm -f "$LOCK_FILE" 2>/dev/null || true
+        exec 200>"$LOCK_FILE" || error_exit "Failed to open lock file for takeover"
+        if ! flock -n 200; then
+            error_exit "Failed to acquire lock after stale lock removal; another process likely acquired it."
+        fi
     fi
 fi
 
-# Write current PID to the lock file - do this atomically
-printf "%s" "$$" > "$LOCK_FILE" || error_exit "Failed to write PID to lock file"
-chmod 600 "$LOCK_FILE"
+# We hold the flock on fd 200 — ensure file content is clean then write our PID
+: > "$LOCK_FILE" 2>/dev/null || true
+printf "%s\n" "$$" >&200 || error_exit "Failed to write PID to lock file"
+chmod 600 "$LOCK_FILE" 2>/dev/null || true
 
-# Set traps and execute main function
+# Set the EXIT trap BEFORE calling main to ensure cleanup happens on any exit.
 trap on_exit EXIT
-main
+
+# Call main (forward positional args)
+main "$@"

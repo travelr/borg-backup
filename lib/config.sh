@@ -1,35 +1,45 @@
+#!/bin/bash
 #
 # borg-backup - Default Configuration
 # These values can be overridden in a 'borg-backup.conf' file in the same directory as the main script.
 #
 
-# --- Core Paths & Identifiers ---
-STAGING_DIR="/mnt/storage-hdd/backup-staging"
-BORG_REPO="/mnt/storage-hdd/borg-repo"
-DOCKER_COMPOSE_FILE="/home/fuji/docker/docker-compose.yml"
-SECRETS_FILE="/root/borg-backup.env"
-LOCK_FILE="/var/run/backup-borg.lock"
-
-# --- Targeted Backup Directories ---
-BACKUP_DIRS=("/")
+# --- Core Defaults ---
+# NOTE: STAGING_DIR and BORG_REPO are intentionally left empty here.
+# The main script will enforce that these are set by the user in borg-backup.conf.
+: "${STAGING_DIR:=}"
+: "${BORG_REPO:=}"
+: "${DOCKER_COMPOSE_FILE:=}"
+: "${SECRETS_FILE:=/root/borg-backup.env}"
+: "${LOCK_FILE:=/var/run/backup-borg.lock}"
 
 # --- Backup Parameters ---
-RETENTION_DAYS=7
-BORG_COMPRESSION="zstd,9"
+: "${RETENTION_DAYS:=3}"
+: "${BORG_COMPRESSION:=zstd,3}"
 
 # --- Health & Monitoring ---
-MIN_DISK_SPACE_GB=5
-MAX_SYSTEM_LOAD=10.0
-LOG_RETENTION_DAYS=30
+: "${MIN_DISK_SPACE_GB:=1}"
+: "${MAX_SYSTEM_LOAD:=5.0}"
+: "${LOG_RETENTION_DAYS:=7}"
 
 # --- Service Management ---
-SERVICE_OPERATION_TIMEOUT=60
-MAX_DEPENDENCY_ITERATIONS=1000
+: "${SERVICE_OPERATION_TIMEOUT:=30}"
+# NOTE: MAX_DEPENDENCY_ITERATIONS was defined but not used anywhere in the script. It has been removed to avoid confusion.
+# If it's needed for a future feature, it can be re-added.
 
 # --- Notification Configuration (non-sensitive) ---
-BACKUP_NOTIFY_DISCORD_WEBHOOK=""
+: "${BACKUP_NOTIFY_DISCORD_WEBHOOK:=}"
 
-# --- Backup Exclusions ---
+# --- Targeted Backup Directories ---
+# FIX: The original `: "${BACKUP_DIRS[*]:-}"` is incorrect for arrays. If BACKUP_DIRS is not set in the
+# config file, this would create a single-element array containing an empty string, which would cause
+# borg create to fail. The correct approach is to check if the variable is declared and, if not,
+# declare it as an empty array.
+if ! declare -p BACKUP_DIRS >/dev/null 2>&1; then
+    declare -a BACKUP_DIRS=()
+fi
+
+# --- Default Backup Exclusions ---
 # Define common system excludes as an array. These are paths Borg should not traverse or backup.
 BORG_EXCLUDES=(
     # --- Standard Borg Best Practice ---
@@ -85,3 +95,47 @@ BORG_EXCLUDES=(
     --exclude='/var/log/*.gz'
     --exclude='/var/log/*.1'
 )
+
+# --- Default Database Config (empty) ---
+# This associative array will be populated by the add_database function in the user's config.
+declare -A DB_CONFIGS
+
+# --- Default Application Paths to Exclude (empty) ---
+# FIX: Same fix as BACKUP_DIRS. Ensure this is an empty array if not defined by the user.
+if ! declare -p APP_PATHS_TO_EXCLUDE >/dev/null 2>&1; then
+    declare -a APP_PATHS_TO_EXCLUDE=()
+fi
+
+
+# --- Internal Configuration ---
+# Do not modify below this line
+
+# Function to add database configurations.
+# This function is defined here to be available within the user's borg-backup.conf file.
+# Usage: add_database <container_name> <database_type> <username>
+# Example: add_database "db" "mariadb" "root"
+add_database() {
+    local container_name="$1"
+    local db_type="$2"
+    local username="${3:-}"
+
+    if [ -z "$container_name" ] || [ -z "$db_type" ]; then
+        echo "ERROR: Invalid database configuration. Usage: add_database container_name database_type [username]" >&2
+        return 1
+    fi
+
+    if [[ "$db_type" != "influxdb" ]] && [ -z "$username" ]; then
+        echo "ERROR: Username required for non-InfluxDB databases" >&2
+        return 1
+    fi
+
+    case "$db_type" in
+        mysql|mariadb|postgres|postgresql|influxdb) ;;
+        *) echo "WARNING: Unknown database type '$db_type' for container '$container_name'" >&2 ;;
+    esac
+
+    if [[ -n "${DB_CONFIGS[$container_name]+isset}" ]]; then
+        echo "WARNING: Database '$container_name' already configured, overwriting" >&2
+    fi
+    DB_CONFIGS["$container_name"]="$db_type|$username"
+}
