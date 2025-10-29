@@ -16,25 +16,25 @@ verify_archive_integrity() {
 
     log "Verifying archive integrity..."
     local archive_entry="${BORG_REPO}::${ARCHIVE_NAME}"
-    local verify_tmpdir="$STAGING_DIR/verify-tmp"
+    local verify_temp_dir="$STAGING_DIR/verify-tmp"
 
     # Initialize variables for robust cleanup
-    local tmp_extracted="" tmp_err=""
+    local temp_extracted_file="" temp_error_log=""
     local preserve_on_failure=false
 
     # Prepare temp workspace, with a fallback to /tmp if needed
-    mkdir -p "$verify_tmpdir" 2>/dev/null || verify_tmpdir="/tmp"
+    mkdir -p "$verify_temp_dir" 2>/dev/null || verify_temp_dir="/tmp"
 
     # Create temporary files for extraction and error logging
-    tmp_extracted="$(mktemp "$verify_tmpdir/borg_verify_extracted.XXXXXX" 2>/dev/null)" || tmp_extracted="$verify_tmpdir/borg_verify_extracted.$$"
-    tmp_err="$(mktemp "$verify_tmpdir/borg_verify_err.XXXXXX" 2>/dev/null)" || tmp_err="$verify_tmpdir/borg_verify_err.$$"
+    temp_extracted_file="$(mktemp "$verify_temp_dir/borg_verify_extracted.XXXXXX" 2>/dev/null)" || temp_extracted_file="$verify_temp_dir/borg_verify_extracted.$$"
+    temp_error_log="$(mktemp "$verify_temp_dir/borg_verify_err.XXXXXX" 2>/dev/null)" || temp_error_log="$verify_temp_dir/borg_verify_err.$$"
 
     # Ensure temporary files are always cleaned up on exit from this function
     cleanup_verify_tmp() {
         if [ "${preserve_on_failure:-false}" = "true" ] && [ "${DEBUG:-false}" = "true" ]; then
-            log_warn "Preserving verification artifacts for debugging: $tmp_extracted $tmp_err"
+            log_warn "Preserving verification artifacts for debugging: $temp_extracted_file $temp_error_log"
         else
-            rm -f "${tmp_extracted:-}" "${tmp_err:-}" 2>/dev/null || true
+            rm -f "${temp_extracted_file:-}" "${temp_error_log:-}" 2>/dev/null || true
         fi
     }
     trap cleanup_verify_tmp RETURN
@@ -47,7 +47,7 @@ verify_archive_integrity() {
     fi
 
     # 2) Check 2: Find and verify the database dump tarball.
-    if ! _verify_db_tarball "$archive_entry" "$tmp_extracted" "$tmp_err"; then
+    if ! _verify_db_tarball "$archive_entry" "$temp_extracted_file" "$temp_error_log"; then
         log_error "DB tarball verification failed. The backup is considered incomplete."
         preserve_on_failure=true
         return 1
@@ -67,9 +67,59 @@ verify_archive_integrity() {
 
 # --- Helper Verification Functions ---
 
+# Securely extracts a single file from an archive by using a temporary containment directory.
+# Prevents path traversal and other extraction-based attacks.
+# Usage: _secure_extract_one_file "archive_entry" "path_in_archive" "destination_file"
+_secure_extract_one_file() {
+    local archive_entry="$1"
+    local path_in_archive="$2"
+    local destination_file="$3"
+
+    # 1. Sanity Check: Reject obviously malicious paths.
+    if [[ "$path_in_archive" =~ \.\./ ]]; then
+        log_error "  Extraction REJECTED: Malicious path traversal detected in '$path_in_archive'."
+        return 1
+    fi
+    if [[ "$path_in_archive" =~ ^/ ]]; then
+        log_error "  Extraction REJECTED: Absolute path detected in archive path '$path_in_archive'."
+        return 1
+    fi
+
+    # 2. Containment: Create a secure, temporary directory for the extraction.
+    local secure_extract_dir
+    secure_extract_dir=$(mktemp -d "$STAGING_DIR/verify_extract_XXXXXX")
+    # Ensure this directory is always cleaned up when the function returns.
+    trap "rm -rf '$secure_extract_dir'" RETURN
+
+    log_debug "  Securely extracting '$path_in_archive' into containment dir: $secure_extract_dir"
+
+    # Extract the single file. We use a subshell to change directory safely.
+    if ! (cd "$secure_extract_dir" && borg_run borg extract "$archive_entry" "$path_in_archive" >/dev/null 2>&1); then
+        log_error "  borg extract command failed for '$path_in_archive'."
+        return 1
+    fi
+
+    # 3. Validation: Verify that exactly ONE file was extracted.
+    local extracted_file_count
+    extracted_file_count=$(find "$secure_extract_dir" -type f | wc -l)
+
+    if [ "$extracted_file_count" -ne 1 ]; then
+        log_error "  Extraction DANGER: Expected 1 file, but found $extracted_file_count. Possible archive manipulation detected."
+        return 1
+    fi
+
+    # 4. Move the verified file to its final destination.
+    local extracted_file
+    extracted_file=$(find "$secure_extract_dir" -type f -print -quit)
+    # The 'mv' command will write to /dev/null if that's the destination, which is fine.
+    mv "$extracted_file" "$destination_file"
+
+    return 0
+}
+
 # Verifies the DB tarball with logic that adapts to the execution mode.
 _verify_db_tarball() {
-    local archive_entry="$1" tmp_extracted="$2" tmp_err="$3"
+    local archive_entry="$1" temp_extracted_file="$2" temp_error_log="$3"
     local tarball_entry=""
 
     # --- BLOCK 1: Logic for Backup Mode ---
@@ -109,23 +159,22 @@ _verify_db_tarball() {
     # This block runs if a tarball was found in either mode.
     log "Found DB tarball in archive: $tarball_entry"
 
-    if ! borg_run borg extract "$archive_entry" "$tarball_entry" --stdout >"$tmp_extracted" 2>"$tmp_err"; then
-        log_error "Failed to extract DB tarball: $tarball_entry"
-        sed -n '1,10p' "$tmp_err" 2>/dev/null | while IFS= read -r l; do log_error "  -> $l"; done
+     if ! _secure_extract_one_file "$archive_entry" "$tarball_entry" "$temp_extracted_file"; then
+        log_error "Failed to securely extract DB tarball: $tarball_entry"
         return 1
     fi
 
-    if [ ! -s "$tmp_extracted" ]; then
+    if [ ! -s "$temp_extracted_file" ]; then
         log_error "Extracted DB tarball is empty, indicating a failure during the dump process."
         return 1
     fi
 
-    if ! gzip -t "$tmp_extracted" >/dev/null 2>&1; then
+    if ! gzip -t "$temp_extracted_file" >/dev/null 2>&1; then
         log_error "Extracted file is not a valid gzip file."
         return 1
     fi
 
-    if ! tar -tzf "$tmp_extracted" >/dev/null 2>"$tmp_err"; then
+    if ! tar -tzf "$temp_extracted_file" >/dev/null 2>"$temp_error_log"; then
         log_error "Tarball integrity check failed. The archive may be corrupt."
         return 1
     fi
@@ -166,7 +215,7 @@ _verify_spot_checks() {
         # 1. Get the complete list of files and use grep for an exact, unambiguous match.
         if borg_run borg list "$archive_entry" --format '{path}{NL}' | grep -Fxq "$relative_path"; then
             # The file exists. Now, 2. Attempt to extract it to confirm readability.
-            if ! borg_run borg extract "$archive_entry" "$relative_path" --stdout >/dev/null 2>&1; then
+            if ! _secure_extract_one_file "$archive_entry" "$relative_path" "/dev/null"; then
                 log_warn "Extraction FAILED for: $sample_file (as $relative_path)"
                 spot_failed=true
             else

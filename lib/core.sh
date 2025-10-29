@@ -90,45 +90,27 @@ portable_realpath() {
     fi
 }
 
-# Validate that the directory part of output_file is inside base_dir (both resolved)
+# Validates that the directory for a dump file is securely located within the main DB_DUMP_DIR.
 validate_dump_path() {
     local output_file="$1"
     local base_dir="$2"
-
-    if [ -z "$output_file" ] || [ -z "$base_dir" ]; then
-        error_exit "Internal usage error: validate_dump_path requires output_file and base_dir"
-    fi
-
-    # Ensure canonicalization tools exist
-    if ! command -v realpath >/dev/null 2>&1 && ! command -v readlink >/dev/null 2>&1 ; then
-        error_exit "Missing realpath/readlink; cannot safely validate dump paths"
-    fi
-
     local path_dir
+
     path_dir=$(dirname -- "$output_file")
 
-    local abs_path_dir abs_base_dir
-    abs_path_dir=$(portable_realpath "$path_dir")
-    abs_base_dir=$(portable_realpath "$base_dir")
-
-    if [ -z "$abs_path_dir" ] || [ -z "$abs_base_dir" ]; then
-        error_exit "Could not resolve paths for dump validation (path_dir='$path_dir', base_dir='$base_dir')"
+    # Use our new centralized, secure validator.
+    # This checks if path_dir is a valid subdirectory of base_dir.
+    if ! validate_path "$path_dir" "$base_dir" >/dev/null; then
+        error_exit "Invalid dump path detected: '$path_dir' is not within the secure staging directory."
     fi
 
-    if [ ! -d "$abs_base_dir" ]; then
-        error_exit "Base dump directory does not exist: $abs_base_dir"
+    # Create the directory if it doesn't exist.
+    if [ ! -d "$path_dir" ]; then
+        mkdir -p -- "$path_dir" || error_exit "Failed to create dump directory: $path_dir"
+        chmod 700 -- "$path_dir" || true
     fi
 
-    if [ "$abs_path_dir" != "$abs_base_dir" ] && [[ "$abs_path_dir" != "$abs_base_dir/"* ]]; then
-        error_exit "Invalid dump path directory: $path_dir (resolved: $abs_path_dir). Must be within $abs_base_dir"
-    fi
-
-    if [ ! -d "$abs_path_dir" ]; then
-        mkdir -p -- "$abs_path_dir" || error_exit "Failed to create dump directory: $abs_path_dir"
-        chmod 700 -- "$abs_path_dir" || true
-    fi
-
-    log_debug "Dump path validated: $abs_path_dir is within $abs_base_dir"
+    log_debug "Dump path validated: $path_dir is within $base_dir"
     return 0
 }
 
@@ -155,29 +137,44 @@ get_password_value() {
     fi
 }
 
-# MySQL/MariaDB dump function
+# MySQL/MariaDB dump function using a secure script pipe to protect the password.
 dump_mysql() {
     local container_id="$1"
     local password="$2"
     local output_file="$3"
-    local db_type="$4" 
+    local db_type="$4"
 
     validate_dump_path "$output_file" "$DB_DUMP_DIR"
 
-    # Choose the correct dumper command based on the database type
     local dumper_cmd="mysqldump"
     if [[ "$db_type" == "mariadb" ]]; then
         dumper_cmd="mariadb-dump"
     fi
-
     log_debug "Using dumper command: $dumper_cmd"
 
-    "${RESOURCE_NICE_CMD[@]}" docker exec -e MYSQL_PWD="$password" "$container_id" \
-        sh -c "exec $dumper_cmd --user=root --single-transaction --quick --all-databases 2>&1" \
-        | gzip > "$output_file" || error_exit "MySQL/MariaDB dump failed for container $container_id"
+    # Create a secure, temporary script to hold the dump command with the password.
+    local temp_script
+    temp_script=$(mktemp) || error_exit "Failed to create temporary script for MySQL dump"
+    # Ensure the script is always removed when the function returns.
+    trap "rm -f '$temp_script'" RETURN
+    chmod 600 "$temp_script"
+
+    # Write the command to the script. The --password flag is used directly.
+    # Note: We avoid a shebang here as we're piping to 'sh' directly.
+    printf "exec %s --user=root --password='%s' --single-transaction --quick --all-databases 2>&1\n" \
+        "$dumper_cmd" "$password" > "$temp_script"
+
+    log_debug "Executing secure MySQL/MariaDB dump via stdin pipe..."
+    # Pipe the script into the container's shell. The password is never exposed on the host.
+    if ! "${RESOURCE_NICE_CMD[@]}" docker exec -i "$container_id" sh < "$temp_script" | gzip > "$output_file"; then
+        error_exit "MySQL/MariaDB dump failed for container $container_id"
+    fi
+
+    # The trap will handle the final rm -f.
+    return 0
 }
 
-# PostgreSQL dump function
+# PostgreSQL dump function using a secure script pipe to protect the password.
 dump_postgres() {
     local container_id="$1"
     local password="$2"
@@ -186,8 +183,26 @@ dump_postgres() {
 
     validate_dump_path "$output_file" "$DB_DUMP_DIR"
 
-    "${RESOURCE_NICE_CMD[@]}" docker exec -e PGPASSWORD="$password" "$container_id" \
-        pg_dumpall -U "$user" 2>&1 | gzip > "$output_file" || error_exit "PostgreSQL dump failed for container $container_id"
+    # Create a secure, temporary script.
+    local temp_script
+    temp_script=$(mktemp) || error_exit "Failed to create temporary script for PostgreSQL dump"
+    # Ensure the script is always removed when the function returns.
+    trap "rm -f '$temp_script'" RETURN
+    chmod 600 "$temp_script"
+
+    # Write the command to the script. PGPASSWORD is set only for the scope of the 'exec' command
+    # inside the container's ephemeral shell, not on the host.
+    printf "export PGPASSWORD='%s'; exec pg_dumpall -U '%s' 2>&1\n" \
+        "$password" "$user" > "$temp_script"
+
+    log_debug "Executing secure PostgreSQL dump via stdin pipe..."
+    # Pipe the script into the container's shell.
+    if ! "${RESOURCE_NICE_CMD[@]}" docker exec -i "$container_id" sh < "$temp_script" | gzip > "$output_file"; then
+        error_exit "PostgreSQL dump failed for container $container_id"
+    fi
+
+    # The trap will handle the final rm -f.
+    return 0
 }
 
 # InfluxDB 1.8 dump function (no password required)

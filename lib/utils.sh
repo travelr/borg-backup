@@ -6,7 +6,10 @@
 # Generic log function with timestamp and log level
 log(){ 
     local level="${2:-INFO}"
-    printf '%s - [%s] %s\n' "$(date +"%Y-%m-%d %H:%M:%S")" "$level" "$1" | tee -a "$LOG_FILE"  >&2
+    local message="$1"
+    # Remove control characters and limit length
+    message=$(printf '%s' "$message" | tr -d '\000-\010\013\014\016-\037' | head -c 1000)
+    printf '%s - [%s] %s\n' "$(date +"%Y-%m-%d %H:%M:%S")" "$level" "$message" | tee -a "$LOG_FILE"  >&2
 }
 
 log_info() { log "$1" "INFO"; }
@@ -20,8 +23,11 @@ log_debug() {
 
 # This is the correct and only version of the function.
 error_exit(){ 
-    log_error "FATAL ERROR: $1"
-    send_notification "failure" "Backup failed on $HOST_ID: $1"
+    local exit_code=$?
+    local line_number="${1:-unknown}"
+    local message="$2"
+    log_error "FATAL ERROR at line $line_number (exit code $exit_code): $message"
+    send_notification "failure" "Backup failed on $HOST_ID: $message (line $line_number)"
     if [ -n "${PROGRESS_PID:-}" ]; then
         kill "$PROGRESS_PID" 2>/dev/null || true
     fi
@@ -90,8 +96,15 @@ borg_run() {
         return 1
     fi
 
+    # Ensure TMPDIR is secure
+    local secure_tmpdir="${TMPDIR:-/tmp}"
+    if [[ ! "$secure_tmpdir" =~ ^(/tmp|/var/tmp|/dev/shm) ]]; then
+        log_error "TMPDIR is set to an insecure location: $secure_tmpdir"
+        return 1
+    fi
+
     local passfile
-    passfile=$(mktemp "${TMPDIR:-/tmp}/borg-pass.XXXXXX") || {
+    passfile=$(mktemp "$secure_tmpdir/borg-pass.XXXXXX") || {
         log_error "borg_run: failed to create temp passfile"
         return 1
     }
@@ -116,3 +129,36 @@ borg_run() {
     return $rc
 }
 
+# Validates a given path, ensuring it is absolute and optionally within a specified base directory.
+# Resolves all symlinks and relative components to get the canonical path.
+# On success, echoes the resolved, canonical path. On failure, logs an error and returns 1.
+# Usage: resolved_path=$(validate_path "/path/to/check" "/allowed/base") || exit 1
+validate_path() {
+    local path_to_validate="$1"
+    # Default to the root directory if no base is provided.
+    local allowed_base="${2:-/}"
+    local resolved_path=""
+    local resolved_base=""
+
+    # Resolve the allowed base first to ensure it's a valid path.
+    resolved_base=$(realpath -m "$allowed_base" 2>/dev/null) || {
+        log_error "Cannot resolve allowed base path: '$allowed_base'"
+        return 1
+    }
+
+    # Resolve the user-provided path. -m allows non-existent paths to be resolved.
+    resolved_path=$(realpath -m "$path_to_validate" 2>/dev/null) || {
+        log_error "Cannot resolve path: '$path_to_validate'"
+        return 1
+    }
+
+    # The core security check: does the resolved path start with the resolved base path?
+    if [[ "$resolved_path" != "$resolved_base"* ]]; then
+        log_error "Path '$path_to_validate' (resolved to '$resolved_path') is outside the allowed base directory '$resolved_base'."
+        return 1
+    fi
+
+    # Success: echo the safe, canonicalized path to be captured by the caller.
+    echo "$resolved_path"
+    return 0
+}
