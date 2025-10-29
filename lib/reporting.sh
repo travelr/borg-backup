@@ -7,23 +7,21 @@
 verify_archive_integrity() {
     if [ "$DRY_RUN" = true ]; then return; fi
     log "Verifying archive integrity..."
-
-    # Export the passphrase for all borg commands within this function.
-    export BORG_PASSPHRASE
     
     # 1. Verify the archive exists in the repository
-    borg list "$BORG_REPO::$ARCHIVE_NAME" >/dev/null || {
-        unset BORG_PASSPHRASE
+    if ! borg_run borg list "$BORG_REPO::$ARCHIVE_NAME" >/dev/null 2>&1; then
         error_exit "Archive verification failed: Could not find created archive."
-    }
+    fi
     
     # 2. Verify database dumps (if created) are present in the archive
     if [ "$DUMPS_CREATED" = true ]; then
-        local dump_dir_basename; dump_dir_basename=$(basename "$DB_DUMP_DIR")
-
-        # check for a specific file pattern known to be inside the dump directory.
-        if ! borg list "$BORG_REPO::$ARCHIVE_NAME" --format '{path}\n' | grep -qE "${dump_dir_basename}/.*(_dump\.sql\.gz|_influxdb\.tar\.gz)$"; then
-            unset BORG_PASSPHRASE
+        # We no longer need the basename of the temp directory.
+        local archive_listing
+        archive_listing=$(borg_run borg list "$BORG_REPO::$ARCHIVE_NAME" --format '{path}\n' 2>/dev/null || true)
+        
+        # THIS PATTERN IS CORRECT. It looks for any file ending in the expected dump suffixes,
+        # which matches the actual structure inside the Borg archive.
+        if ! printf '%s' "$archive_listing" | grep -qE "(_dump\.sql\.gz|_influxdb\.tar\.gz)$"; then
             error_exit "Database dump files not found in backup archive."
         fi
     fi
@@ -32,7 +30,9 @@ verify_archive_integrity() {
     log "Performing spot restore checks..."
     local file_list
     # The mapfile and shuf solution is more robust for special characters
-    mapfile -d '' file_list < <(borg list "$BORG_REPO::$ARCHIVE_NAME" --format '{path}{NUL}' | grep -vz '/$' || true)
+    local file_list_output
+    file_list_output=$(borg_run borg list "$BORG_REPO::$ARCHIVE_NAME" --format '{path}{NUL}' 2>/dev/null || true)
+    mapfile -d '' file_list < <(printf '%s' "$file_list_output" | grep -vz '/$' || true)
 
     if [ ${#file_list[@]} -eq 0 ]; then
         log "WARNING: Archive appears empty, cannot perform spot restore check."
@@ -55,21 +55,17 @@ verify_archive_integrity() {
 
             local sample_file="${file_list[$index]}"
             log "  Spot checking: $sample_file"
-            if ! borg extract "$BORG_REPO::$ARCHIVE_NAME" "$sample_file" --stdout >/dev/null; then
+            if ! borg_run borg extract "$BORG_REPO::$ARCHIVE_NAME" "$sample_file" --stdout >/dev/null; then
                 log_error "Failed to restore sample file: $sample_file"
                 check_failed=true
             fi
         done
 
         if [ "$check_failed" = true ]; then
-            unset BORG_PASSPHRASE
             error_exit "One or more spot restore checks failed."
         fi
     fi
     log "Archive integrity and restorability verified."
-
-    # Unset the passphrase at the very end of the function.
-    unset BORG_PASSPHRASE
 }
 
 # Finds and checks the application-level integrity of any SQLite databases in the backup
@@ -87,7 +83,7 @@ check_backed_up_sqlite_integrity() {
     trap cleanup_temp_dir RETURN
 
     local sqlite_dbs
-    sqlite_dbs=$(borg list "$BORG_REPO::$ARCHIVE_NAME" --format '{path}\n' | grep -E '\.(db|sqlite|sqlite3)$' || true)
+    sqlite_dbs=$(borg_run borg list "$BORG_REPO::$ARCHIVE_NAME" --format '{path}\n' | grep -E '\.(db|sqlite|sqlite3)$' || true)
     if [ -z "$sqlite_dbs" ]; then 
         log "No SQLite databases found."
         # The RETURN trap will automatically clean up the temp directory.
@@ -109,7 +105,7 @@ check_backed_up_sqlite_integrity() {
         log "Checking: $db_path"
         
         # Extract the database file
-        if ! borg extract "$BORG_REPO::$ARCHIVE_NAME" "$db_path" --stdout > "$temp_db_file"; then
+        if ! borg_run borg extract "$BORG_REPO::$ARCHIVE_NAME" "$db_path" --stdout > "$temp_db_file"; then
             log_error "  ERROR: Failed to extract $db_path"
             check_failed=true
             continue
@@ -155,7 +151,7 @@ collect_metrics() {
     if [ "$DRY_RUN" = true ]; then return; fi
     log "Collecting backup metrics..."
     local metrics_file="$LOG_DIR/metrics_${TIMESTAMP}.json"
-    local archive_info; archive_info=$(borg info "$BORG_REPO::$ARCHIVE_NAME" --json 2>/dev/null || echo "{}")
+    local archive_info; archive_info=$(borg_run borg info "$BORG_REPO::$ARCHIVE_NAME" --json 2>/dev/null || echo "{}")
     local archive_size; archive_size=$(echo "$archive_info" | jq -r '.archives[0].stats.original_size // 0')
     local compressed_size; compressed_size=$(echo "$archive_info" | jq -r '.archives[0].stats.compressed_size // 0')
     local duration=$(( $(date +%s) - START_TIME ))

@@ -101,11 +101,9 @@ BORG_EXCLUDES=(
 declare -A DB_CONFIGS
 
 # --- Default Application Paths to Exclude (empty) ---
-# FIX: Same fix as BACKUP_DIRS. Ensure this is an empty array if not defined by the user.
 if ! declare -p APP_PATHS_TO_EXCLUDE >/dev/null 2>&1; then
     declare -a APP_PATHS_TO_EXCLUDE=()
 fi
-
 
 # --- Internal Configuration ---
 # Do not modify below this line

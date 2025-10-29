@@ -133,17 +133,21 @@ validate_dump_path() {
 get_password_value() {
     local container_name="$1"
 
-    # Sanitize container name: replace hyphens with underscores and convert to uppercase.
-    # This allows 'postgres-immich' to map to SECURE_POSTGRES_IMMICH_PASSWORD.
+    # Sanitize container name...
     local safe_name="${container_name//-/_}"
     local password_var="SECURE_${safe_name^^}_PASSWORD"
 
     if [ -n "${!password_var:-}" ]; then
-        log_debug "Found and using specific password variable: $password_var"
+        # The debug message is redirected to stderr (>&2) so it appears on the
+        # console but is NOT captured by the command substitution `$(...)`.
+        log_debug "Found and using specific password variable: $password_var" >&2
+        
+        # The echo command is the ONLY thing that prints to stdout, so it becomes
+        # the sole value of the variable.
         echo "${!password_var}"
     else
-        # If the specific variable is not found, fail loudly. Do not guess.
-        log_error "No specific password found for container '$container_name'. Please define '$password_var' in your secrets file."
+        # Error messages should also go to stderr.
+        log_error "No specific password found for container '$container_name'. Please define '$password_var' in your secrets file." >&2
         echo ""
     fi
 }
@@ -263,21 +267,16 @@ run_borg_backup() {
         
         log "Initializing Borg repository at $BORG_REPO"
         # Export passphrase for init; unset ONLY on failure.
-        export BORG_PASSPHRASE
-        borg init --encryption=repokey-blake2 "$BORG_REPO" || {
-            unset BORG_PASSPHRASE
+        if ! borg_run borg init --encryption=repokey-blake2 "$BORG_REPO"; then
             error_exit "Failed to initialize Borg repository at $BORG_REPO"
-        }
+        fi
         log "Borg repository initialized successfully"
     fi
 
     # Validate passphrase is available for the main operations
     if [ -z "${BORG_PASSPHRASE:-}" ]; then
-        error_exit "BORG_PASSPHRASE is not set in the environment"
+        error_exit "BORG_PASSPHRASE must be set in the secrets file"
     fi
-
-    # Export passphrase ONCE for all subsequent borg commands in this function.
-    export BORG_PASSPHRASE
 
     # Build command with resource limits if available
     local cmd_prefix=()
@@ -331,10 +330,8 @@ run_borg_backup() {
     log_debug "Full borg command: ${borg_cmd[*]}"
     
     # Execute backup with passphrase in environment
-    log "Creating backup archive"
-    export BORG_PASSPHRASE
-    if "${borg_cmd[@]}"; then
-        # Exit code 0: Perfect success.
+        # Run borg through borg_run so passphrase is supplied securely per-invocation.
+    if borg_run "${borg_cmd[@]}"; then
         log "Borg create completed successfully."
     else
         local exit_code=$?
@@ -343,7 +340,6 @@ run_borg_backup() {
             log_warn "Borg create completed with warnings (exit code $exit_code). The backup archive is considered valid."
         else
             # Any other non-zero exit code is a FATAL ERROR.
-            unset BORG_PASSPHRASE
             error_exit "Borg create command failed with a fatal error (exit code $exit_code)."
         fi
     fi
@@ -354,17 +350,13 @@ run_borg_backup() {
             log "Pruning old archives..."
             local prune_cmd=( "${cmd_prefix[@]}" borg prune -v --list "$BORG_REPO" --keep-daily="$RETENTION_DAYS" )
             
-            if "${prune_cmd[@]}"; then
-                # Exit code 0: Perfect success.
+            if borg_run "${prune_cmd[@]}"; then
                 log "Prune completed successfully."
             else
                 local exit_code=$?
-                # Check for any WARNING exit code (1, or 100-127 for modern).
                 if [ "$exit_code" -eq 1 ] || { [ "$exit_code" -ge 100 ] && [ "$exit_code" -le 127 ]; }; then
                     log_warn "Borg prune completed with warnings (exit code $exit_code)."
                 else
-                    # Any other non-zero exit code is a FATAL ERROR.
-                    unset BORG_PASSPHRASE
                     error_exit "Borg prune command failed with a fatal error (exit code $exit_code)."
                 fi
             fi
@@ -375,8 +367,6 @@ run_borg_backup() {
         log "Skipping prune due to --no-prune"
     fi
 
-    # Unset the passphrase at the very end of the function after all operations are complete.
-    unset BORG_PASSPHRASE
     return 0
 }
 
@@ -385,17 +375,10 @@ run_borg_repository_check() {
     log "Performing a full check of the Borg repository..."
     log "Verifying repository integrity with --verify-data"
 
-    # Export the passphrase for the command's environment
-    export BORG_PASSPHRASE
-    
-    # Run the command and ensure the passphrase is unset even on failure
-    borg check --verify-data "$BORG_REPO" || {
-        unset BORG_PASSPHRASE
+    # Use borg_run so the passphrase is supplied securely for this command.
+    if ! borg_run borg check --verify-data "$BORG_REPO"; then
         error_exit "CRITICAL: Borg repository integrity check failed!"
-    }
-    
-    # Unset the passphrase on success
-    unset BORG_PASSPHRASE
+    fi
     
 }
 

@@ -6,7 +6,7 @@
 # Generic log function with timestamp and log level
 log(){ 
     local level="${2:-INFO}"
-    printf '%s - [%s] %s\n' "$(date +"%Y-%m-%d %H:%M:%S")" "$level" "$1" | tee -a "$LOG_FILE"
+    printf '%s - [%s] %s\n' "$(date +"%Y-%m-%d %H:%M:%S")" "$level" "$1" | tee -a "$LOG_FILE"  >&2
 }
 
 log_info() { log "$1" "INFO"; }
@@ -79,3 +79,38 @@ docker_compose_cmd() {
 
     "${__docker_compose_cmd_cached[@]}" -f "$DOCKER_COMPOSE_FILE" "$@"
 }
+
+# Run borg with a short-lived secure passphrase file using BORG_PASSCOMMAND (works on Borg 1.x)
+# Usage: borg_run <command> <arg1> <arg2> ...
+borg_run() {
+    if [ -z "${BORG_PASSPHRASE:-}" ]; then
+        log_error "borg_run: BORG_PASSPHRASE is not set (shell variable)."
+        return 1
+    fi
+
+    local passfile
+    passfile=$(mktemp "${TMPDIR:-/tmp}/borg-pass.XXXXXX") || {
+        log_error "borg_run: failed to create temp passfile"
+        return 1
+    }
+    chmod 600 "$passfile" || { rm -f "$passfile"; return 1; }
+    printf '%s' "$BORG_PASSPHRASE" > "$passfile" || { rm -f "$passfile"; return 1; }
+
+    export BORG_PASSCOMMAND="cat $passfile"
+
+    # Execute the supplied command (preserves prefixes like ionice/nice)
+    "$@"
+    local rc=$?
+
+    unset BORG_PASSCOMMAND
+
+    if command -v shred >/dev/null 2>&1; then
+        shred -u "$passfile" 2>/dev/null || rm -f "$passfile"
+    else
+        log "WARNING: 'shred' not found — secure deletion falling back to rm -f"
+        rm -f "$passfile"
+    fi
+
+    return $rc
+}
+

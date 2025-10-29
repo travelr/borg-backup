@@ -175,6 +175,11 @@ cleanup() {
 on_exit() {
     local exit_code=$?
 
+    # Defensive cleanup: clear any in-memory passphrase and remove short-lived passfiles
+    BORG_PASSPHRASE=""
+    unset BORG_PASSPHRASE
+    rm -f /tmp/borg-pass.* 2>/dev/null || true
+
     # Only remove lock file if we are the owner
     if [ -f "$LOCK_FILE" ]; then
         lock_pid=$(cat "$LOCK_FILE" 2>/dev/null || echo "")
@@ -264,6 +269,10 @@ main() {
     collect_metrics
     print_backup_summary
     rotate_logs
+
+    # Clear the passphrase from the shell after all borg operations are complete
+    BORG_PASSPHRASE=""
+    unset BORG_PASSPHRASE
 
     log "--- Backup Script Completed Successfully ---"
     send_notification "success" "Backup completed successfully on $HOST_ID. Archive: $ARCHIVE_NAME"

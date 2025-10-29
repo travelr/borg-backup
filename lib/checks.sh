@@ -166,13 +166,9 @@ perform_pre_flight_checks() {
     check_system_health
     handle_borg_lock
     if [ -d "$BORG_REPO" ]; then
-        # Temporarily export the passphrase to check repo accessibility.
-        # DO NOT unset it here, as it is needed by the main backup functions later.
-        export BORG_PASSPHRASE
-        borg list "$BORG_REPO" >/dev/null 2>&1 || {
-            # It is still good practice to unset on failure before exiting.
-            unset BORG_PASSPHRASE
+        # Check repository accessibility via borg_run wrapper (supplies passphrase securely per-call)
+        if ! borg_run borg list "$BORG_REPO" >/dev/null 2>&1; then
             error_exit "Borg repository exists but is not accessible or cannot be opened."
-        }
+        fi
     fi
 }
