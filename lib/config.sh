@@ -61,7 +61,7 @@ BORG_EXCLUDES=(
 
     # --- Mounted Filesystems ---
     # You don't want the backup to unexpectedly cross into network drives, USB sticks, or other mounted partitions.
-    --exclude='/mnt'
+    #--exclude='/mnt' --one-file-system, therefore redundant, has to be removed, so that staging dir can be inside /mnt
     --exclude='/media'
 
     # --- System-Generated & Reproducible Data ---

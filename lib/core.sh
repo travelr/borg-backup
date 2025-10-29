@@ -19,7 +19,10 @@ run_database_dumps() {
 
         if [ -n "$container_id" ]; then
             local db_password=""
-            db_password=$(get_password_value "$container_name")
+
+            if [[ "$db_type" != "influxdb" ]]; then
+                db_password=$(get_password_value "$container_name")
+            fi
 
             if [[ -n "$db_password" ]] || [[ "$db_type" == "influxdb" ]]; then
                 # Define a default output file for SQL dumps
@@ -323,8 +326,22 @@ run_borg_backup() {
     borg_cmd+=( "$BORG_REPO::$ARCHIVE_NAME" )
     borg_cmd+=( "${BACKUP_DIRS[@]}" )
     
-    # Add database dumps if created
-    [ "$DUMPS_CREATED" = true ] && [ -d "$DB_DUMP_DIR" ] && borg_cmd+=( "$DB_DUMP_DIR" )
+    # Add database dumps: package into a single tarball under STAGING_DIR to avoid exclude issues
+    if [ "$DUMPS_CREATED" = true ] && [ -d "$DB_DUMP_DIR" ]; then
+        # Create tarball path (global variable used by cleanup/verification)
+        DB_DUMP_ARCHIVE="$STAGING_DIR/${HOST_ID}_db_dumps_${TIMESTAMP}.tar.gz"
+        log "Packaging DB dumps into $DB_DUMP_ARCHIVE"
+
+        # Create tarball using -C so internal paths are relative
+        if ! tar -C "$DB_DUMP_DIR" -czf "$DB_DUMP_ARCHIVE" .; then
+            error_exit "Failed to create DB dump tarball at $DB_DUMP_ARCHIVE"
+        fi
+
+        chmod 600 "$DB_DUMP_ARCHIVE" || true
+
+        # Add the single tarball to the borg command (safer than adding the temp dir)
+        borg_cmd+=( "$DB_DUMP_ARCHIVE" )
+    fi
 
     # Debug logging
     log_debug "Full borg command: ${borg_cmd[*]}"

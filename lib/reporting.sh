@@ -3,88 +3,206 @@
 # borg-backup - Reporting and Advanced Integrity Functions
 #
 
-# Performs multi-level checks on the newly created archive for integrity
+# --- Main Verification Function ---
+
+# Performs multi-level, strict checks on the newly created archive for integrity.
+# This function will fail the script if any critical verification step does not pass.
 verify_archive_integrity() {
-    if [ "$DRY_RUN" = true ]; then return; fi
+    # No-op for dry run
+    if [ "${DRY_RUN:-false}" = "true" ]; then
+        log "DRY_RUN: Skipping archive integrity verification."
+        return 0
+    fi
+
     log "Verifying archive integrity..."
-    
-    # 1. Verify the archive exists in the repository
-    if ! borg_run borg list "$BORG_REPO::$ARCHIVE_NAME" >/dev/null 2>&1; then
-        error_exit "Archive verification failed: Could not find created archive."
+    local archive_entry="${BORG_REPO}::${ARCHIVE_NAME}"
+    local verify_tmpdir="$STAGING_DIR/verify-tmp"
+
+    # Initialize variables for robust cleanup
+    local tmp_extracted="" tmp_err=""
+    local preserve_on_failure=false
+
+    # Prepare temp workspace, with a fallback to /tmp if needed
+    mkdir -p "$verify_tmpdir" 2>/dev/null || verify_tmpdir="/tmp"
+
+    # Create temporary files for extraction and error logging
+    tmp_extracted="$(mktemp "$verify_tmpdir/borg_verify_extracted.XXXXXX" 2>/dev/null)" || tmp_extracted="$verify_tmpdir/borg_verify_extracted.$$"
+    tmp_err="$(mktemp "$verify_tmpdir/borg_verify_err.XXXXXX" 2>/dev/null)" || tmp_err="$verify_tmpdir/borg_verify_err.$$"
+
+    # Ensure temporary files are always cleaned up on exit from this function
+    cleanup_verify_tmp() {
+        if [ "${preserve_on_failure:-false}" = "true" ] && [ "${DEBUG:-false}" = "true" ]; then
+            log_warn "Preserving verification artifacts for debugging: $tmp_extracted $tmp_err"
+        else
+            rm -f "${tmp_extracted:-}" "${tmp_err:-}" 2>/dev/null || true
+        fi
+    }
+    trap cleanup_verify_tmp RETURN
+
+    # 1) Check 1: Ensure the archive exists in the repository.
+    if ! borg_run borg list "$archive_entry" >/dev/null 2>&1; then
+        log_error "Archive verification failed: Could not find the created archive ($archive_entry)."
+        preserve_on_failure=true
+        return 1
     fi
-    
-    # 2. Verify database dumps (if created) are present in the archive
+
+    # 2) Check 2: Find and verify the database dump tarball.
+    if ! _verify_db_tarball "$archive_entry" "$tmp_extracted" "$tmp_err"; then
+        log_error "DB tarball verification failed. The backup is considered incomplete."
+        preserve_on_failure=true
+        return 1
+    fi
+
+    # 3) Check 3: Perform spot checks on critical system files.
+    if ! _verify_spot_checks "$archive_entry"; then
+        log_error "Critical file spot-checks failed. The backup's integrity cannot be confirmed."
+        preserve_on_failure=true
+        return 1
+    fi
+
+    log "Archive integrity and restorability verified."
+    return 0
+}
+
+
+# --- Helper Verification Functions ---
+
+# Verifies the DB tarball with logic that adapts to the execution mode.
+_verify_db_tarball() {
+    local archive_entry="$1" tmp_extracted="$2" tmp_err="$3"
+    local tarball_entry=""
+
+    # --- BLOCK 1: Logic for Backup Mode ---
+    # If a dump was created in this run, we MUST find the specific file for this timestamp.
+    # This is a strict check.
     if [ "$DUMPS_CREATED" = true ]; then
-        # We no longer need the basename of the temp directory.
-        local archive_listing
-        archive_listing=$(borg_run borg list "$BORG_REPO::$ARCHIVE_NAME" --format '{path}\n' 2>/dev/null || true)
-        
-        # THIS PATTERN IS CORRECT. It looks for any file ending in the expected dump suffixes,
-        # which matches the actual structure inside the Borg archive.
-        if ! printf '%s' "$archive_listing" | grep -qE "(_dump\.sql\.gz|_influxdb\.tar\.gz)$"; then
-            error_exit "Database dump files not found in backup archive."
+        local ts_part="${ARCHIVE_NAME#*-}"
+        # This is a true regular expression: "ends with _db_dumps_YYYY-MM-DD_HH-MM-SS.tar.gz"
+        local expected_pattern="_db_dumps_${ts_part}\\.tar\\.gz$"
+
+        log_debug "Backup mode: Searching for specific DB tarball with regex: $expected_pattern"
+        # Use grep -E for Extended Regular Expressions to correctly interpret the pattern.
+        tarball_entry="$(borg_run borg list "$archive_entry" --format '{path}{NL}' 2>/dev/null | grep -E -m 1 "$expected_pattern" | tr -d '\n\r' || true)"
+
+        if [ -z "$tarball_entry" ]; then
+            log_error "Could not find the expected DB tarball created in this run (pattern: $expected_pattern)."
+            return 1
+        fi
+
+    # --- BLOCK 2: Logic for Verify-Only Mode ---
+    # If no dump was created, we are in verify-only mode. Perform a generic, exploratory search.
+    else
+        # This is a generic regex to find *any* database dump tarball.
+        local generic_pattern='_db_dumps_.*\.tar\.gz$'
+        log_debug "Verify-only mode: Performing generic search for any DB tarball with regex: $generic_pattern"
+        tarball_entry="$(borg_run borg list "$archive_entry" --format '{path}{NL}' 2>/dev/null | grep -E -m 1 "$generic_pattern" | tr -d '\n\r' || true)"
+
+        # Corrected syntax: no curly braces inside the 'if' block.
+        if [ -z "$tarball_entry" ]; then
+            # This is NOT an error in this mode, as the archive might be old and not have a dump.
+            log "No DB tarball found in this archive; skipping DB artifact check."
+            return 0
         fi
     fi
-    
-    # 3. Perform random spot restore checks to test restorability
-    log "Performing spot restore checks..."
-    local file_list
-    # The mapfile and shuf solution is more robust for special characters
-    local file_list_output
-    file_list_output=$(borg_run borg list "$BORG_REPO::$ARCHIVE_NAME" --format '{path}{NUL}' 2>/dev/null || true)
-    mapfile -d '' file_list < <(printf '%s' "$file_list_output" | grep -vz '/$' || true)
 
-    if [ ${#file_list[@]} -eq 0 ]; then
-        log "WARNING: Archive appears empty, cannot perform spot restore check."
-    else
-        local sample_indices=()
-        if command -v shuf >/dev/null 2>&1; then
-            for i in $(seq 0 $((${#file_list[@]} - 1)) | shuf -n 3); do
-                sample_indices+=("$i")
-            done
-        else # Fallback for systems without shuf
-            # ... (alternative random selection if needed, or just pick first 3)
-            log_warn "shuf command not found, using first 3 files for spot check."
-            sample_indices=(0 1 2)
-        fi
-        
-        local check_failed=false
-        for index in "${sample_indices[@]}"; do
-            # Ensure we don't go out of bounds if there are fewer than 3 files
-            [ -z "${file_list[$index]:-}" ] && continue
+    # --- COMMON VERIFICATION LOGIC ---
+    # This block runs if a tarball was found in either mode.
+    log "Found DB tarball in archive: $tarball_entry"
 
-            local sample_file="${file_list[$index]}"
-            log "  Spot checking: $sample_file"
-            if ! borg_run borg extract "$BORG_REPO::$ARCHIVE_NAME" "$sample_file" --stdout >/dev/null; then
-                log_error "Failed to restore sample file: $sample_file"
-                check_failed=true
+    if ! borg_run borg extract "$archive_entry" "$tarball_entry" --stdout >"$tmp_extracted" 2>"$tmp_err"; then
+        log_error "Failed to extract DB tarball: $tarball_entry"
+        sed -n '1,10p' "$tmp_err" 2>/dev/null | while IFS= read -r l; do log_error "  -> $l"; done
+        return 1
+    fi
+
+    if [ ! -s "$tmp_extracted" ]; then
+        log_error "Extracted DB tarball is empty, indicating a failure during the dump process."
+        return 1
+    fi
+
+    if ! gzip -t "$tmp_extracted" >/dev/null 2>&1; then
+        log_error "Extracted file is not a valid gzip file."
+        return 1
+    fi
+
+    if ! tar -tzf "$tmp_extracted" >/dev/null 2>"$tmp_err"; then
+        log_error "Tarball integrity check failed. The archive may be corrupt."
+        return 1
+    fi
+
+    log "DB tarball restore test passed."
+    return 0
+}
+
+
+# Performs strict spot checks on critical files with robust path resolution.
+_verify_spot_checks() {
+    local archive_entry="$1"
+    # Define a list of critical files we expect to find.
+    local critical_files=("/etc/hostname" "/etc/passwd" "/etc/group")
+    local spot_failed=false
+
+    log_debug "Starting spot checks for critical files..."
+
+    for sample_file in "${critical_files[@]}"; do
+        local relative_path=""
+
+        # Robust Logic: Find the correct relative path based on all possible backup roots.
+        for root_dir in "${BACKUP_DIRS[@]}"; do
+            # Check if the file path starts with the backup directory path.
+            if [[ "$sample_file" == "$root_dir"* ]]; then
+                relative_path="${sample_file#$root_dir}"
+                relative_path="${relative_path#/}"
+                break # Match found, no need to check other roots.
             fi
         done
 
-        if [ "$check_failed" = true ]; then
-            error_exit "One or more spot restore checks failed."
+        # If the file isn't covered by any BACKUP_DIRS entry, skip it.
+        if [ -z "$relative_path" ]; then
+            log_debug "Skipping check for $sample_file (not within any configured BACKUP_DIRS)."
+            continue
         fi
+
+        # 1. Get the complete list of files and use grep for an exact, unambiguous match.
+        if borg_run borg list "$archive_entry" --format '{path}{NL}' | grep -Fxq "$relative_path"; then
+            # The file exists. Now, 2. Attempt to extract it to confirm readability.
+            if ! borg_run borg extract "$archive_entry" "$relative_path" --stdout >/dev/null 2>&1; then
+                log_warn "Extraction FAILED for: $sample_file (as $relative_path)"
+                spot_failed=true
+            else
+                log "Spot check OK: $sample_file"
+            fi
+        else
+            log_warn "File NOT FOUND in archive: $sample_file (expected at $relative_path)"
+            spot_failed=true
+        fi
+    done
+
+    # If any of the spot checks failed, return a failure code.
+    if [ "$spot_failed" = true ]; then
+        return 1
     fi
-    log "Archive integrity and restorability verified."
+
+    log_debug "All applicable spot checks passed."
+    return 0
 }
+
+
+# --- Other Reporting and Maintenance Functions ---
 
 # Finds and checks the application-level integrity of any SQLite databases in the backup
 check_backed_up_sqlite_integrity() {
     if [ "$DRY_RUN" = true ]; then return; fi
     log "Checking integrity of SQLite databases in the backup..."
-    
     local temp_extract_dir
     temp_extract_dir=$(mktemp -d "$STAGING_DIR/tmp_sqlite_XXXXXXXX")
-    # Ensure the temp directory is cleaned up when the function exits or returns.
-    # The RETURN trap is perfect for function-local cleanup.
-    cleanup_temp_dir() {
-        rm -rf "$temp_extract_dir"
-    }
-    trap cleanup_temp_dir RETURN
+    trap 'rm -rf "$temp_extract_dir"' RETURN
 
     local sqlite_dbs
-    sqlite_dbs=$(borg_run borg list "$BORG_REPO::$ARCHIVE_NAME" --format '{path}\n' | grep -E '\.(db|sqlite|sqlite3)$' || true)
-    if [ -z "$sqlite_dbs" ]; then 
+    sqlite_dbs=$(borg_run borg list "$BORG_REPO::$ARCHIVE_NAME" --format '{path}
+' | grep -E '\.(db|sqlite|sqlite3)$' || true)
+
+    if [ -z "$sqlite_dbs" ]; then
         log "No SQLite databases found."
         # The RETURN trap will automatically clean up the temp directory.
         return
@@ -130,9 +248,9 @@ check_backed_up_sqlite_integrity() {
         if [[ "$integrity_result" == "ok" ]]; then
             log "  OK: Integrity verified for $db_path"
         else
-            log_error "  WARNING: Integrity check FAILED for $db_path"
+            log_error "  ERROR: Integrity check FAILED for $db_path"
             check_failed=true
-            while IFS= read -r line; do 
+            while IFS= read -r line; do
                 log "    SQLite Error: $line"
             done <<< "$integrity_result"
         fi
@@ -142,7 +260,7 @@ check_backed_up_sqlite_integrity() {
     
     log "SQLite integrity check completed. Checked $db_count database(s)."
     if [ "$check_failed" = true ]; then
-        log "WARNING: One or more SQLite databases failed integrity check"
+        log_warn "One or more SQLite databases failed integrity check"
     fi
 }
 

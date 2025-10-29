@@ -53,12 +53,14 @@ check_lock_pid() {
 # Displays the help message
 show_help() {
     echo "Borg Backup Script"
-    echo "Usage: $0 [--dry-run | --check-only | --no-prune | --repo-check | --check-sqlite | --debug | --help]"
+    echo "Usage: $0 [--dry-run | --check-only | --no-prune | --repo-check | --check-sqlite | --verify-only | --archive ARCHIVE_NAME | --debug | --help]"
     echo "  --dry-run      Simulate all operations without making changes."
     echo "  --check-only   Run pre-flight checks only, then exit."
     echo "  --no-prune     Skip pruning old archives."
     echo "  --repo-check   Run repository integrity check."
     echo "  --check-sqlite Run application-level integrity check on backed up SQLite files."
+    echo "  --verify-only  Run archive verification on the latest archive (or specify with --archive)."
+    echo "  --archive      Specify an archive name to verify (used with --verify-only)."
     echo "  --debug        Enable debug logging."
     echo "  --help         Display this help message."
 }

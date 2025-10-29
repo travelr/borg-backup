@@ -82,16 +82,19 @@ fi
 # --- Early runtime variables (needed for logging/error handling during parsing) ---
 START_TIME=$(date +%s)
 HOST_ID="${HOST_ID:-$(hostname --fqdn 2>/dev/null || hostname -s)}"
-TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
-ARCHIVE_NAME="${HOST_ID}-${TIMESTAMP}"
+
+# Only generate a timestamp if we're not in verify-only mode
+# We need to check this after argument parsing, so we'll set these later
+TIMESTAMP=""
+ARCHIVE_NAME=""
 
 # Ensure staging & log dirs exist for bootstrap logging
 mkdir -p "$STAGING_DIR"
 LOG_DIR="$STAGING_DIR/logs"
 mkdir -p "$LOG_DIR"
 
-# FIX: Re-assign LOG_FILE to its final, persistent location now that the directory exists.
-LOG_FILE="$LOG_DIR/bootstrap_${TIMESTAMP}.log"
+# Use a temporary log file for now, we'll rename it later
+LOG_FILE="/tmp/borg-backup-early-$$.log"
 touch "$LOG_FILE"
 chmod 600 "$LOG_FILE"
 
@@ -125,6 +128,8 @@ NO_PRUNE=false
 REPO_CHECK=false
 CHECK_SQLITE=false
 DEBUG=false
+VERIFY_ONLY=false
+SPECIFIED_ARCHIVE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -133,6 +138,8 @@ while [[ $# -gt 0 ]]; do
         --no-prune) NO_PRUNE=true ;;
         --repo-check) REPO_CHECK=true ;;
         --check-sqlite) CHECK_SQLITE=true ;;
+        --verify-only) VERIFY_ONLY=true ;;
+        --archive) SPECIFIED_ARCHIVE="$2"; shift ;;
         --debug) DEBUG=true ;;
         --help) show_help && exit 0 ;;
         *) error_exit "Unknown option: $1" ;;
@@ -157,23 +164,48 @@ fi
 ################################################################################
 
 # cleanup is called by the EXIT trap
+# cleanup is called by the EXIT trap
+# This function prioritizes deleting temporary dump files (dir and tarball) on *any* exit.
 cleanup() {
     local end_time duration
     end_time=$(date +%s)
     duration=$((end_time - START_TIME))
-    if [ "$DRY_RUN" = false ]; then
-        if [ -n "${DB_DUMP_DIR:-}" ] && [ -d "$DB_DUMP_DIR" ]; then
-            log "Cleaning up temporary dump directory..."
-            rm -rf "$DB_DUMP_DIR"
-        fi
+
+    # --- CRITICAL: Always attempt to remove temporary dump files ---
+    # This runs regardless of success/failure/DRY_RUN to prevent accumulation.
+    if [ -n "${DB_DUMP_DIR:-}" ] && [ -d "$DB_DUMP_DIR" ]; then
+        log "Cleaning up temporary dump directory (on exit)..."
+        # Use '|| true' to ensure cleanup continues even if rm fails for some reason
+        rm -rf "$DB_DUMP_DIR" || log_warn "Failed to remove temporary dump directory: $DB_DUMP_DIR"
     fi
 
+    # Remove the per-run DB tarball (from STAGING_DIR) if it exists.
+    # This also runs regardless of success/failure/DRY_RUN to prevent accumulation.
+    # The original logic for preserving on failure + DEBUG is moved *after* the deletion attempt,
+    # or removed if we want aggressive cleanup always.
+    if [ -n "${DB_DUMP_ARCHIVE:-}" ] && [ -f "$DB_DUMP_ARCHIVE" ]; then
+        log "Removing DB dump archive (on exit): $DB_DUMP_ARCHIVE"
+        # Use '|| true' to ensure cleanup continues even if rm fails for some reason
+        rm -f "$DB_DUMP_ARCHIVE" || log_warn "Failed to remove DB dump archive: $DB_DUMP_ARCHIVE"
+    fi
+    # --- End of critical cleanup ---
+
+    # Other cleanup tasks (like logging duration) follow
+    if [ "$DRY_RUN" = false ]; then
+        # (Any other non-temporary-file cleanup could go here if needed)
+        :
+    else
+        log "DRY_RUN: skipping other non-temp dump removals"
+    fi
     log "Script execution time: $duration seconds."
 }
 
 # on_exit is the master trap handler for script completion or interrupt
 on_exit() {
     local exit_code=$?
+
+    # Export the exit code for cleanup() to examine
+    EXIT_CODE_GLOBAL=$exit_code
 
     # Defensive cleanup: clear any in-memory passphrase and remove short-lived passfiles
     BORG_PASSPHRASE=""
@@ -240,6 +272,7 @@ main() {
 
     log "--- Starting Borg Backup Script ---"
     if [ "$DRY_RUN" = true ]; then log "--- DRY RUN MODE ENABLED ---"; fi
+    if [ "$VERIFY_ONLY" = true ]; then log "--- VERIFY ONLY MODE ENABLED ---"; fi
 
     perform_pre_flight_checks
 
@@ -248,6 +281,62 @@ main() {
         log "--- Pre-flight checks completed successfully ---"
         return 0
     fi
+
+    # If --verify-only is specified, use the latest archive or a specific one
+    if [ "$VERIFY_ONLY" = true ]; then
+        # Set TIMESTAMP for logging purposes
+        TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+        
+        # Update the log file with the proper timestamp
+        LOG_FILE="$LOG_DIR/bootstrap_verify_${TIMESTAMP}.log"
+        touch "$LOG_FILE"
+        chmod 600 "$LOG_FILE"
+        
+        # If a specific archive is provided, use it
+        if [ -n "$SPECIFIED_ARCHIVE" ]; then
+            ARCHIVE_NAME="$SPECIFIED_ARCHIVE"
+            log "Using specified archive: $ARCHIVE_NAME"
+        # If ARCHIVE_NAME is not set, get the latest archive
+        elif [ -z "${ARCHIVE_NAME:-}" ]; then
+            log "No archive specified, using the latest archive"
+            # Retrieve the latest archive name, explicitly remove trailing whitespace
+            ARCHIVE_NAME=$(borg_run borg list "$BORG_REPO" --last 1 --format '{name}' 2>/dev/null | head -n1 | tr -d '\n\r' || true)
+            if [ -z "$ARCHIVE_NAME" ]; then
+                error_exit "No archives found in repository"
+            fi
+            # Validate the retrieved name doesn't contain newlines or carriage returns
+            if [[ "$ARCHIVE_NAME" == *$'\n'* ]] || [[ "$ARCHIVE_NAME" == *$'\r'* ]]; then
+                error_exit "Retrieved archive name contains unexpected characters (newline/carriage return)"
+            fi
+            log "Using archive: $ARCHIVE_NAME"
+        else
+            log "Using archive: $ARCHIVE_NAME"
+        fi
+        
+        # Run verification on the specified archive
+        verify_archive_integrity
+        
+        # Run optional SQLite check if requested
+        if [ "$CHECK_SQLITE" = true ]; then
+            check_backed_up_sqlite_integrity
+        fi
+        
+        collect_metrics
+        print_backup_summary
+        
+        log "--- Archive Verification Completed ---"
+        send_notification "success" "Archive verification completed on $HOST_ID. Archive: $ARCHIVE_NAME"
+        return 0
+    fi
+
+    # For regular backup mode, set TIMESTAMP and ARCHIVE_NAME
+    TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+    ARCHIVE_NAME="${HOST_ID}-${TIMESTAMP}"
+
+    # Update the log file with the proper timestamp
+    LOG_FILE="$LOG_DIR/bootstrap_${TIMESTAMP}.log"
+    touch "$LOG_FILE"
+    chmod 600 "$LOG_FILE"
 
     # Run repository check if requested
     if [ "$REPO_CHECK" = true ]; then

@@ -41,7 +41,7 @@ check_dependencies() {
 # Validates that critical configuration variables are set and are valid
 validate_configuration() {
     log "Validating configuration..."
-    # FIX: Use a regex that enforces positive integers (>= 1), not just any number.
+    # Validate numeric configuration values
     [[ ! "$RETENTION_DAYS" =~ ^[1-9][0-9]*$ ]] && error_exit "RETENTION_DAYS must be a positive integer (>= 1)"
     [[ ! "$MIN_DISK_SPACE_GB" =~ ^[1-9][0-9]*$ ]] && error_exit "MIN_DISK_SPACE_GB must be a positive integer (>= 1)"
     [[ ! "$SERVICE_OPERATION_TIMEOUT" =~ ^[1-9][0-9]*$ ]] && error_exit "SERVICE_OPERATION_TIMEOUT must be a positive integer (>= 1)"
@@ -51,15 +51,28 @@ validate_configuration() {
     for key in "${path_keys[@]}"; do
         [[ "${!key}" != /* ]] && error_exit "Configuration key '$key' must be an absolute path"
     done
-    
-    # FIX: Check for existence of files that MUST exist before the script runs.
-    # BORG_REPO is intentionally excluded as the script can create it.
+
+    # Verify that critical configuration files exist
     local file_keys=("DOCKER_COMPOSE_FILE" "SECRETS_FILE")
     for key in "${file_keys[@]}"; do
         if [ ! -e "${!key}" ]; then
             error_exit "Configuration file does not exist: ${!key}"
         fi
     done
+
+    # Ensure STAGING_DIR is usable and not matched by BORG_EXCLUDES
+    if [ -z "${STAGING_DIR:-}" ]; then
+        error_exit "STAGING_DIR must be set in configuration"
+    fi
+
+    # Try to create STAGING_DIR if missing (script must be able to write there)
+    if ! mkdir -p "$STAGING_DIR" 2>/dev/null; then
+        error_exit "STAGING_DIR ($STAGING_DIR) cannot be created or is not writable"
+    fi
+    if [ ! -w "$STAGING_DIR" ]; then
+        error_exit "STAGING_DIR ($STAGING_DIR) is not writable by the running user"
+    fi
+    
 }
 
 # Verifies secrets file permissions and securely loads DB credentials
