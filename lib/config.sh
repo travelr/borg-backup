@@ -43,7 +43,7 @@ fi
 # Define common system excludes as an array. These are paths Borg should not traverse or backup.
 BORG_EXCLUDES=(
     # --- Standard Borg Best Practice ---
-    --exclude-caches  # Exclude all directories containing a CACHEDIR.TAG file
+    --exclude-caches # Exclude all directories containing a CACHEDIR.TAG file
 
     # --- Virtual Filesystems (CRITICAL to exclude) ---
     # These are not real files on disk but interfaces to the kernel. Backing them up is useless and can cause errors.
@@ -66,12 +66,12 @@ BORG_EXCLUDES=(
 
     # --- System-Generated & Reproducible Data ---
     # This is the key area for optimization. Exclude anything the system can rebuild on its own.
-    --exclude='/lost+found'     # Filesystem recovery data
-    --exclude='/swapfile'       # The system swap file
-    --exclude='/var/cache'      # System-wide package and application caches
+    --exclude='/lost+found'          # Filesystem recovery data
+    --exclude='/swapfile'            # The system swap file
+    --exclude='/var/cache'           # System-wide package and application caches
     --exclude='/var/lib/apt/lists/*' # APT package lists (rebuilt by 'apt update')
-    --exclude='/usr/src'        # Linux headers and other source files (reinstallable)
-    
+    --exclude='/usr/src'             # Linux headers and other source files (reinstallable)
+
     # --- Docker: A Strategic Choice ---
     # Excludes the entire Docker runtime (images, containers, networks). This is the correct "stateless"
     # approach when your persistent data is in volumes, which are backed up as part of the filesystem.
@@ -128,8 +128,8 @@ add_database() {
     fi
 
     case "$db_type" in
-        mysql|mariadb|postgres|postgresql|influxdb) ;;
-        *) echo "WARNING: Unknown database type '$db_type' for container '$container_name'" >&2 ;;
+    mysql | mariadb | postgres | postgresql | influxdb) ;;
+    *) echo "WARNING: Unknown database type '$db_type' for container '$container_name'" >&2 ;;
     esac
 
     if [[ -n "${DB_CONFIGS[$container_name]+isset}" ]]; then

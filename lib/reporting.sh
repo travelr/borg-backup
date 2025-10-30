@@ -64,7 +64,6 @@ verify_archive_integrity() {
     return 0
 }
 
-
 # --- Helper Verification Functions ---
 
 # Securely extracts a single file from an archive by using a temporary containment directory.
@@ -159,7 +158,7 @@ _verify_db_tarball() {
     # This block runs if a tarball was found in either mode.
     log "Found DB tarball in archive: $tarball_entry"
 
-     if ! _secure_extract_one_file "$archive_entry" "$tarball_entry" "$temp_extracted_file"; then
+    if ! _secure_extract_one_file "$archive_entry" "$tarball_entry" "$temp_extracted_file"; then
         log_error "Failed to securely extract DB tarball: $tarball_entry"
         return 1
     fi
@@ -182,7 +181,6 @@ _verify_db_tarball() {
     log "DB tarball restore test passed."
     return 0
 }
-
 
 # Performs strict spot checks on critical files with robust path resolution.
 _verify_spot_checks() {
@@ -235,7 +233,6 @@ _verify_spot_checks() {
     log_debug "All applicable spot checks passed."
     return 0
 }
-
 
 # --- Other Reporting and Maintenance Functions ---
 
@@ -296,9 +293,9 @@ check_backed_up_sqlite_integrity() {
         local temp_db_file="$temp_extract_dir/$safe_basename"
 
         log "Checking: $db_path"
-        
+
         # Extract the database file
-        if ! borg_run borg extract "$BORG_REPO::$ARCHIVE_NAME" "$db_path" --stdout > "$temp_db_file"; then
+        if ! borg_run borg extract "$BORG_REPO::$ARCHIVE_NAME" "$db_path" --stdout >"$temp_db_file"; then
             log_error "  ERROR: Failed to extract $db_path"
             check_failed=true
             continue
@@ -326,9 +323,9 @@ check_backed_up_sqlite_integrity() {
             check_failed=true
             while IFS= read -r line; do
                 log "    SQLite Error: $line"
-            done <<< "$integrity_result"
+            done <<<"$integrity_result"
         fi
-    done <<< "$sqlite_dbs"
+    done <<<"$sqlite_dbs"
 
     log "SQLite integrity check completed. Checked $db_count database(s)."
     if [ "$check_failed" = true ]; then
@@ -341,17 +338,20 @@ collect_metrics() {
     if [ "$DRY_RUN" = true ]; then return; fi
     log "Collecting backup metrics..."
     local metrics_file="$LOG_DIR/metrics_${TIMESTAMP}.json"
-    local archive_info; archive_info=$(borg_run borg info "$BORG_REPO::$ARCHIVE_NAME" --json 2>/dev/null || echo "{}")
-    local archive_size; archive_size=$(echo "$archive_info" | jq -r '.archives[0].stats.original_size // 0')
-    local compressed_size; compressed_size=$(echo "$archive_info" | jq -r '.archives[0].stats.compressed_size // 0')
-    local duration=$(( $(date +%s) - START_TIME ))
-    
+    local archive_info
+    archive_info=$(borg_run borg info "$BORG_REPO::$ARCHIVE_NAME" --json 2>/dev/null || echo "{}")
+    local archive_size
+    archive_size=$(echo "$archive_info" | jq -r '.archives[0].stats.original_size // 0')
+    local compressed_size
+    compressed_size=$(echo "$archive_info" | jq -r '.archives[0].stats.compressed_size // 0')
+    local duration=$(($(date +%s) - START_TIME))
+
     # Use '|| true' on jq to prevent script exit if jq fails for some reason, though it shouldn't.
     jq -n \
         --arg timestamp "$TIMESTAMP" --arg archive_name "$ARCHIVE_NAME" \
         --argjson archive_size "$archive_size" --argjson compressed_size "$compressed_size" \
         --argjson duration "$duration" \
-        '{ timestamp: $timestamp, archive_name: $archive_name, archive_size: $archive_size, compressed_size: $compressed_size, duration: $duration }' > "$metrics_file" || error_exit "Failed to write metrics file."
+        '{ timestamp: $timestamp, archive_name: $archive_name, archive_size: $archive_size, compressed_size: $compressed_size, duration: $duration }' >"$metrics_file" || error_exit "Failed to write metrics file."
     log "Metrics collected: $metrics_file"
 }
 
