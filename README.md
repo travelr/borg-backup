@@ -1,21 +1,17 @@
 # Borg Backup Automation Script
-
-***
-
-# Borg Backup Automation Script
-This script automates reliable, secure, and efficient backups using BorgBackup—with a focus on real-world usability. It’s built for systems that run containerized applications (especially via Docker Compose) and need both filesystem and database backups in one streamlined process.
+This script automates reliable, secure, and efficient backups using BorgBackup — with a focus on a self hosted system. 
+It’s built for the case that you need both filesystem and database backups in one streamlined process.
 
 ## What It Does
--   **Smart, automated backups: Creates encrypted, deduplicated, and versioned backups of your chosen directories
--   **Automatic database dumps: Detects running MariaDB, MySQL, PostgreSQL, and InfluxDB containers and safely dumps their data before backing it up.
--   **Easy to configure: All settings live in a clean, well-commented config file—no code changes required.
--   **Security-first: Sensitive credentials are kept in a separate, permission-locked secrets file and never exposed in logs or command lines.
--   **Safe execution: Before starting, it checks system health—like available disk space and CPU load—to avoid backups that could destabilize your system.
--   **Built-in verification: After each backup, it runs integrity checks to confirm your data is not just stored, but actually restorable.
--   **Prevents conflicts: Uses file locking to ensure only one backup runs at a time—no race conditions or overlapping jobs.
--   **Keeps you informed: Optional Discord notifications let you know immediately if a backup succeeds or fails.
+-   Smart, automated backups: Creates encrypted, deduplicated, and versioned backups of your chosen directories
+-   Automatic database dumps: Detects running MariaDB, MySQL, PostgreSQL, and InfluxDB containers and safely dumps their data before backing it up.
+-   Easy to configure: All settings live in a clean, well-commented config file—no code changes required.
+-   Security-first: Sensitive credentials are kept in a separate, permission-locked secrets file and never exposed in logs or command lines.
+-   Safe execution: Before starting, it checks system health—like available disk space and CPU load—to avoid backups that could destabilize your system.
+-   Built-in verification: After each backup, it runs integrity checks to confirm your data is not just stored, but actually restorable.
+-   Prevents conflicts: Uses file locking to ensure only one backup runs at a time—no race conditions or overlapping jobs.
+-   Keeps you informed: Optional Discord notifications let you know immediately if a backup succeeds or fails.
 
-***
 
 ## 🚀 Setup Guide
 
@@ -32,9 +28,8 @@ sudo apt-get update && sudo apt-get install borgbackup jq coreutils util-linux f
 
 ### Step 2: Create the Configuration File
 
-Create a file named `borg-backup.conf` in the same directory as the `borg-backup.sh` script. This file defines *what* and *how* to back up.
-
-Below is a minimal, working example. Copy this and replace the placeholder paths with your own.
+Clone the repository and then copy the example configuration file or create your own.
+Below is a minimal, working example.
 
 ```bash
 #
@@ -74,7 +69,7 @@ add_database "influxdb" "influxdb" # Only v1.8, no username required
 
 Create a file to store your sensitive credentials. By default, the script looks for this at `/root/borg-backup.env`.
 
-**This file MUST be secured, or the script will refuse to run:**
+This file MUST be secured, or the script will refuse to run:
 ```bash
 sudo touch /root/borg-backup.env
 sudo chmod 600 /root/borg-backup.env

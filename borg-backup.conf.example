@@ -1,0 +1,118 @@
+#
+# borg-backup.conf.example
+#
+# This is an example configuration file for the Borg Backup Automation Script.
+#
+# IMPORTANT: To use this file, first copy it to 'borg-backup.conf':
+#
+#   cp borg-backup.conf.example borg-backup.conf
+#
+# Then, edit 'borg-backup.conf' with your own settings.
+#
+
+################################################################################
+# REQUIRED SETTINGS
+################################################################################
+
+# --- Core Paths ---
+# These variables MUST be set for the script to function.
+
+# The absolute path to your Borg repository.
+# This can be a local path or a remote one using SSH notation.
+# Example Local:  BORG_REPO="/mnt/backups/borg-repo"
+# Example Remote: BORG_REPO="user@server.com:/path/to/repo"
+BORG_REPO="/path/to/your/repo"
+
+# An absolute path to a temporary working directory.
+# This is used for database dumps and temporary verification files.
+# For best performance, this should be on a fast disk (like an SSD) and,
+# if possible, a different physical disk from your BORG_REPO.
+STAGING_DIR="/var/tmp/borg-staging"
+
+# --- Backup Sources ---
+# An array of absolute paths on the host system to be backed up.
+# You can list multiple directories.
+# To back up the entire root filesystem, use: BACKUP_DIRS=("/")
+BACKUP_DIRS=(
+    "/etc"
+    "/home"
+    "/var/www"
+)
+
+# --- Docker Integration ---
+# The absolute path to the docker-compose.yml file that defines your services.
+# This is required for the script to find and dump your database containers.
+DOCKER_COMPOSE_FILE="/path/to/your/docker-compose.yml"
+
+
+################################################################################
+# DATABASE DEFINITIONS (REQUIRED IF YOU HAVE DATABASES)
+################################################################################
+
+# For each database container you want to back up, you must add a line here.
+# The script will automatically find the running container and dump its data.
+#
+# Usage:   add_database "container_name" "database_type" "username"
+#
+# - "container_name": The service name from your docker-compose.yml file.
+# - "database_type":  Must be one of "mariadb", "mysql", "postgres", or "influxdb".
+# - "username":       The user for the dump command (e.g., "root" or "postgres").
+#                     (Not required for "influxdb").
+
+# --- Examples (uncomment and modify the ones you need) ---
+# add_database "my-mariadb-container"  "mariadb"    "root"
+# add_database "my-postgres-container" "postgres"   "postgres"
+# add_database "my-influxdb-container" "influxdb"
+
+
+################################################################################
+# OPTIONAL SETTINGS
+################################################################################
+#
+# These variables have sensible defaults (defined in lib/config.sh).
+# You only need to uncomment and change them if you want to override the defaults.
+#
+
+# --- Backup Parameters & Retention ---
+
+# Number of daily backups to keep. Old archives are pruned automatically.
+# RETENTION_DAYS=7
+
+# Borg compression algorithm and level. zstd is fast and efficient.
+# BORG_COMPRESSION="zstd,3"
+
+# --- Additional Exclusions ---
+# An array of extra absolute paths for Borg to exclude from the backup.
+# This is useful for excluding large, non-essential, or volatile directories.
+# APP_PATHS_TO_EXCLUDE=()
+# Example:
+# APP_PATHS_TO_EXCLUDE=(
+#     "/var/log"
+#     "/home/user/downloads"
+# )
+
+
+# --- Health & Monitoring ---
+
+# The script will warn if the system's 1-minute load average exceeds this value.
+# MAX_SYSTEM_LOAD="5.0"
+
+# The script will exit with an error if free space at the BORG_REPO or
+# STAGING_DIR locations is below this value in Gigabytes.
+# MIN_DISK_SPACE_GB=1
+
+# Automatically delete log files older than this many days from the STAGING_DIR.
+# LOG_RETENTION_DAYS=7
+
+# Your Discord webhook URL for success and failure notifications.
+# BACKUP_NOTIFY_DISCORD_WEBHOOK=""
+
+
+# --- Advanced / Internal Settings ---
+# It is generally not necessary to change these.
+
+# The absolute path to the secrets file.
+# SECRETS_FILE="/root/borg-backup.env"
+
+# The absolute path to the singleton lock file.
+# LOCK_FILE="/var/run/backup-borg.lock"
