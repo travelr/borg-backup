@@ -1,10 +1,11 @@
 # Borg Backup Automation Script
-This script automates reliable, secure, and efficient backups using BorgBackup — with a focus on a self hosted system. 
-It’s built for the case that you need both filesystem and database backups in one streamlined process.
+-   This script automates reliable, secure, and efficient backups using BorgBackup — with a focus on a self hosted system. 
+-   It’s built for the case that you need both filesystem and database backups in one streamlined process.
+-   Designed for / backups.
 
 ## What It Does
 -   Smart, automated backups: Creates encrypted, deduplicated, and versioned backups of your chosen directories
--   Automatic database dumps: Detects running MariaDB, MySQL, PostgreSQL, and InfluxDB containers and safely dumps their data before backing it up.
+-   Automatic database dumps: Detects running MariaDB, MySQL, PostgreSQL, and InfluxDB 1.8 containers and safely dumps their data before backing it up.
 -   Easy to configure: All settings live in a clean, well-commented config file—no code changes required.
 -   Security-first: Sensitive credentials are kept in a separate, permission-locked secrets file and never exposed in logs or command lines.
 -   Safe execution: Before starting, it checks system health—like available disk space and CPU load—to avoid backups that could destabilize your system.
@@ -43,15 +44,15 @@ Below is a minimal, working example.
 BORG_REPO="/mnt/backups/borg-repo"
 
 # An absolute path to a temporary working directory for dumps and logs.
-STAGING_DIR="/var/tmp/borg-staging"
+STAGING_DIR="/mnt/backups/borg-staging"
 
 # --- (Required) Backup Sources ---
 # An array of absolute paths on the host system to be backed up.
-BACKUP_DIRS=("/var/www" "/home/user/documents")
+BACKUP_DIRS=("/")
 
 # --- (Required) Docker Integration ---
 # Absolute path to the docker-compose file that defines your database services.
-DOCKER_COMPOSE_FILE="/opt/docker/docker-compose.yml"
+DOCKER_COMPOSE_FILE="/home/user/docker/docker-compose.yml"
 
 # --- (Required) Database Definitions ---
 # For each database container you want to back up, call the add_database helper.
@@ -81,18 +82,22 @@ Below is a minimal example you can copy and modify.
 ```bash
 /root/borg-backup.env
 #=== Example Secrets File ===
+
 #--- (Required) Borg Repository Passphrase ---
+
 #This is the master encryption key for your entire backup repository.
 #Keep this somewhere safe. If you lose it, your backups are unrecoverable.
 BORG_PASSPHRASE="your-long-and-very-secure-borg-passphrase"
+
 #--- (Required) Database Passwords for each add_database line ---
+
 #The variable name is constructed as: SECURE_<CONTAINER_NAME>_PASSWORD
 #The container name is converted to UPPERCASE and hyphens (-) are replaced with underscores (_).
 SECURE_APP_MARIADB_PASSWORD="your-mariadb-root-password"
 #...
 ```
 
-Step 4: Initialize the Repository & Run
+### Step 4: Initialize the Repository & Run
 If this is a new repository, you must initialize it once. The script will try to do this automatically, but you can also do it manually.
 
 ```Bash
@@ -106,19 +111,20 @@ borg init --encryption=repokey-blake2 /mnt/backups/borg-repo
 unset BORG_PASSPHRASE
 ```
 
-You are now ready to run your first backup!
+## You are now ready to run your first backup!
 
 ```Bash
 sudo ./borg-backup.sh
 
 Usage & Command-Line Options
+
 The script accepts several command-line flags to modify its behavior.
+
 Flag	Description
 --dry-run	Simulate all operations without making any actual changes to the repository.
 --check-only	Run all pre-flight health and configuration checks, then exit. Useful for validating your setup.
 --no-prune	Skip the pruning of old archives after the backup is complete.
 --repo-check	Performs a full borg check --verify-data on the entire repository before starting the backup.
---check-sqlite	After a backup, finds and verifies all SQLite databases within your Docker app data directory.
 --verify-only	Skips the backup process and runs integrity verification on an existing archive.
 --archive <name>	Used with --verify-only to specify an archive name. If omitted, the latest archive is used.
 --debug	Enables verbose debug logging for troubleshooting.
@@ -148,3 +154,9 @@ graph TD
     H -- Fails --> X;
     X --> J;
 ```
+
+## Discord Notifcations
+
+Just set web hook link. Here is an example what you expect to see at Discord
+
+![Sample](img/borg-backup.png)

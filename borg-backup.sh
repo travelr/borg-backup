@@ -118,6 +118,15 @@ DB_DUMP_DIR=""
 SERVICES_TO_STOP=()
 STOPPED_BY_SCRIPT=()
 
+# Global variables for rich notifications
+declare -x BORG_STATS=""
+declare -x BORG_WARNINGS=""
+declare -x ERROR_CONTEXT=""
+declare -x NOTIFICATION_SENT=false
+
+# Ensure variables are available to sourced scripts
+export BORG_STATS BORG_WARNINGS ERROR_CONTEXT NOTIFICATION_SENT
+
 ################################################################################
 # COMMAND-LINE ARGUMENT PARSING
 ################################################################################
@@ -133,16 +142,19 @@ SPECIFIED_ARCHIVE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --dry-run) DRY_RUN=true ;;
-        --check-only) CHECK_ONLY=true ;;
-        --no-prune) NO_PRUNE=true ;;
-        --repo-check) REPO_CHECK=true ;;
-        --check-sqlite) CHECK_SQLITE=true ;;
-        --verify-only) VERIFY_ONLY=true ;;
-        --archive) SPECIFIED_ARCHIVE="$2"; shift ;;
-        --debug) DEBUG=true ;;
-        --help) show_help && exit 0 ;;
-        *) error_exit "Unknown option: $1" ;;
+    --dry-run) DRY_RUN=true ;;
+    --check-only) CHECK_ONLY=true ;;
+    --no-prune) NO_PRUNE=true ;;
+    --repo-check) REPO_CHECK=true ;;
+    --check-sqlite) CHECK_SQLITE=true ;;
+    --verify-only) VERIFY_ONLY=true ;;
+    --archive)
+        SPECIFIED_ARCHIVE="$2"
+        shift
+        ;;
+    --debug) DEBUG=true ;;
+    --help) show_help && exit 0 ;;
+    *) error_exit "Unknown option: $1" ;;
     esac
     shift
 done
@@ -163,7 +175,6 @@ fi
 # MAIN EXECUTION & TRAP HANDLING
 ################################################################################
 
-# cleanup is called by the EXIT trap
 # cleanup is called by the EXIT trap
 # This function prioritizes deleting temporary dump files (dir and tarball) on *any* exit.
 cleanup() {
@@ -225,8 +236,6 @@ on_exit() {
     # close fd 200 if open
     exec 200>&- 2>/dev/null || true
 
-   
-
     # On failure (non-zero exit code), attempt an emergency restart of services
     if [ "$exit_code" -ne 0 ]; then
         local any_stopped=false
@@ -246,7 +255,7 @@ on_exit() {
         if [ "$any_stopped" = "true" ]; then
             log "Recovery: Found stopped services, attempting to restart them due to script exit (code: $exit_code)..."
             set +e # Prevent trap from exiting if restart fails
-            ( manage_services "start" )
+            (manage_services "start")
             set -e
         fi
     fi
@@ -257,18 +266,34 @@ on_exit() {
 
 # failure_handler is called by the ERR trap on any command failure
 failure_handler() {
-   local line_number=$1
-    log "A failure occurred at line $line_number. Executing failure handler..."
+    local line_number=${1:-unknown}
 
-    if [ "$DRY_RUN" = false ]; then
-        log_warn "The backup for archive '$ARCHIVE_NAME' may be incomplete due to the error."
-        log_warn "It will NOT be deleted automatically. Manual inspection of the repository is recommended."
+    # Prevent recursive calls to the failure handler
+    if [ "${FAILURE_HANDLED:-false}" = "true" ]; then
+        return 0
     fi
+    export FAILURE_HANDLED=true
+
+    # Capture the last 15 lines of the log file for rich error context.
+    if [ -f "$LOG_FILE" ] && [ -s "$LOG_FILE" ]; then
+        ERROR_CONTEXT=$(tail -n 15 "$LOG_FILE")
+    else
+        ERROR_CONTEXT="Log file ($LOG_FILE) not available or empty at time of failure (line $line_number)."
+    fi
+
+    log "A failure occurred at line $line_number. The script will now exit."
+
+    # Exit with error to trigger on_exit
+    exit 1
 }
 
 # The main logic flow of the script
 main() {
-    trap 'failure_handler $LINENO' ERR
+    # Set up signal handlers with protection against recursive calls
+    # Note: We'll set ERR trap selectively to avoid conflicts with borg_run
+    trap 'on_exit' EXIT
+    trap 'log "Received SIGTERM, exiting gracefully..."; exit 143' TERM
+    trap 'log "Received SIGINT, exiting gracefully..."; exit 130' INT
 
     log "--- Starting Borg Backup Script ---"
     if [ "$DRY_RUN" = true ]; then log "--- DRY RUN MODE ENABLED ---"; fi
@@ -286,12 +311,12 @@ main() {
     if [ "$VERIFY_ONLY" = true ]; then
         # Set TIMESTAMP for logging purposes
         TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
-        
+
         # Update the log file with the proper timestamp
         LOG_FILE="$LOG_DIR/bootstrap_verify_${TIMESTAMP}.log"
         touch "$LOG_FILE"
         chmod 600 "$LOG_FILE"
-        
+
         # If a specific archive is provided, use it
         if [ -n "$SPECIFIED_ARCHIVE" ]; then
             ARCHIVE_NAME="$SPECIFIED_ARCHIVE"
@@ -312,18 +337,18 @@ main() {
         else
             log "Using archive: $ARCHIVE_NAME"
         fi
-        
+
         # Run verification on the specified archive
         verify_archive_integrity
-        
+
         # Run optional SQLite check if requested
         if [ "$CHECK_SQLITE" = true ]; then
             check_backed_up_sqlite_integrity
         fi
-        
+
         collect_metrics
         print_backup_summary
-        
+
         log "--- Archive Verification Completed ---"
         send_notification "success" "Archive verification completed on $HOST_ID. Archive: $ARCHIVE_NAME"
         return 0
@@ -343,9 +368,15 @@ main() {
         run_borg_repository_check
     fi
 
+    # Set ERR trap for operations that need it
+    trap 'failure_handler "$LINENO"' ERR
+
     if [ "$DRY_RUN" = false ]; then
         run_database_dumps
     fi
+
+    # Remove ERR trap before borg operations (to avoid conflicts)
+    trap - ERR
 
     run_borg_backup
     verify_archive_integrity
@@ -354,7 +385,7 @@ main() {
     if [ "$CHECK_SQLITE" = true ]; then
         check_backed_up_sqlite_integrity
     fi
-    
+
     collect_metrics
     print_backup_summary
     rotate_logs
@@ -364,7 +395,10 @@ main() {
     unset BORG_PASSPHRASE
 
     log "--- Backup Script Completed Successfully ---"
-    send_notification "success" "Backup completed successfully on $HOST_ID. Archive: $ARCHIVE_NAME"
+    # Only send a "success" message if a "warning" message wasn't already sent.
+    if [ "$NOTIFICATION_SENT" = "false" ]; then
+        send_notification "success" "Backup completed successfully!"
+    fi
 }
 
 # --- Singleton Execution Lock ---
@@ -393,7 +427,7 @@ if ! flock -n 200; then
 fi
 
 # We hold the flock on fd 200 — ensure file content is clean then write our PID
-: > "$LOCK_FILE" 2>/dev/null || true
+: >"$LOCK_FILE" 2>/dev/null || true
 printf "%s\n" "$$" >&200 || error_exit "Failed to write PID to lock file"
 chmod 600 "$LOCK_FILE" 2>/dev/null || true
 

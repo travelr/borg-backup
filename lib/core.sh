@@ -12,7 +12,7 @@ run_database_dumps() {
     local container_name
     for container_name in "${!DB_CONFIGS[@]}"; do
         local config="${DB_CONFIGS[$container_name]}"
-        IFS='|' read -r db_type db_user <<< "$config"
+        IFS='|' read -r db_type db_user <<<"$config"
 
         local container_id
         container_id=$(docker_compose_cmd ps -q "$container_name" 2>/dev/null || true)
@@ -28,43 +28,42 @@ run_database_dumps() {
                 # Define a default output file for SQL dumps
                 local output_file="$DB_DUMP_DIR/${container_name}_dump.sql.gz"
 
-       
                 log "Dumping $db_type from container $container_name..."
-                
+
                 # Wrap dump execution for robust error handling and cleanup
                 case "$db_type" in
-                    "mysql"|"mariadb")
-                        log "  -> Output file: $output_file"
-                        if ! dump_mysql "$container_id" "$db_password" "$output_file" "$db_type"; then
-                            log_error "Dump for $container_name failed, cleaning up partial file..."
-                            rm -f "$output_file"
-                            error_exit "MySQL/MariaDB dump failed for container $container_name"
-                        fi
-                        ;;
-                    "postgres"|"postgresql")
-                        log "  -> Output file: $output_file"
-                        if ! dump_postgres "$container_id" "$db_password" "$db_user" "$output_file"; then
-                            log_error "Dump for $container_name failed, cleaning up partial file..."
-                            rm -f "$output_file"
-                            error_exit "PostgreSQL dump failed for container $container_name"
-                        fi
-                        ;;
-                    "influxdb")
-                        # InfluxDB has a different file extension
-                        output_file="$DB_DUMP_DIR/${container_name}_influxdb.tar.gz"
-                        log "  -> Output file: $output_file"
-                        if ! dump_influxdb "$container_id" "$output_file"; then
-                            log_error "Dump for $container_name failed, cleaning up partial file..."
-                            rm -f "$output_file"
-                            error_exit "InfluxDB dump failed for container $container_name"
-                        fi
-                        ;;
-                    *)
-                        log "WARNING: Unknown database type $db_type for $container_name, skipping"
-                        continue
-                        ;;
+                "mysql" | "mariadb")
+                    log "  -> Output file: $output_file"
+                    if ! dump_mysql "$container_id" "$db_password" "$output_file" "$db_type"; then
+                        log_error "Dump for $container_name failed, cleaning up partial file..."
+                        rm -f "$output_file"
+                        error_exit "MySQL/MariaDB dump failed for container $container_name"
+                    fi
+                    ;;
+                "postgres" | "postgresql")
+                    log "  -> Output file: $output_file"
+                    if ! dump_postgres "$container_id" "$db_password" "$db_user" "$output_file"; then
+                        log_error "Dump for $container_name failed, cleaning up partial file..."
+                        rm -f "$output_file"
+                        error_exit "PostgreSQL dump failed for container $container_name"
+                    fi
+                    ;;
+                "influxdb")
+                    # InfluxDB has a different file extension
+                    output_file="$DB_DUMP_DIR/${container_name}_influxdb.tar.gz"
+                    log "  -> Output file: $output_file"
+                    if ! dump_influxdb "$container_id" "$output_file"; then
+                        log_error "Dump for $container_name failed, cleaning up partial file..."
+                        rm -f "$output_file"
+                        error_exit "InfluxDB dump failed for container $container_name"
+                    fi
+                    ;;
+                *)
+                    log "WARNING: Unknown database type $db_type for $container_name, skipping"
+                    continue
+                    ;;
                 esac
-                
+
                 DUMPS_CREATED=true
 
             else
@@ -126,7 +125,7 @@ get_password_value() {
         # The debug message is redirected to stderr (>&2) so it appears on the
         # console but is NOT captured by the command substitution `$(...)`.
         log_debug "Found and using specific password variable: $password_var" >&2
-        
+
         # The echo command is the ONLY thing that prints to stdout, so it becomes
         # the sole value of the variable.
         echo "${!password_var}"
@@ -162,11 +161,11 @@ dump_mysql() {
     # Write the command to the script. The --password flag is used directly.
     # Note: We avoid a shebang here as we're piping to 'sh' directly.
     printf "exec %s --user=root --password='%s' --single-transaction --quick --all-databases 2>&1\n" \
-        "$dumper_cmd" "$password" > "$temp_script"
+        "$dumper_cmd" "$password" >"$temp_script"
 
     log_debug "Executing secure MySQL/MariaDB dump via stdin pipe..."
     # Pipe the script into the container's shell. The password is never exposed on the host.
-    if ! "${RESOURCE_NICE_CMD[@]}" docker exec -i "$container_id" sh < "$temp_script" | gzip > "$output_file"; then
+    if ! "${RESOURCE_NICE_CMD[@]}" docker exec -i "$container_id" sh <"$temp_script" | gzip >"$output_file"; then
         error_exit "MySQL/MariaDB dump failed for container $container_id"
     fi
 
@@ -193,11 +192,11 @@ dump_postgres() {
     # Write the command to the script. PGPASSWORD is set only for the scope of the 'exec' command
     # inside the container's ephemeral shell, not on the host.
     printf "export PGPASSWORD='%s'; exec pg_dumpall -U '%s' 2>&1\n" \
-        "$password" "$user" > "$temp_script"
+        "$password" "$user" >"$temp_script"
 
     log_debug "Executing secure PostgreSQL dump via stdin pipe..."
     # Pipe the script into the container's shell.
-    if ! "${RESOURCE_NICE_CMD[@]}" docker exec -i "$container_id" sh < "$temp_script" | gzip > "$output_file"; then
+    if ! "${RESOURCE_NICE_CMD[@]}" docker exec -i "$container_id" sh <"$temp_script" | gzip >"$output_file"; then
         error_exit "PostgreSQL dump failed for container $container_id"
     fi
 
@@ -248,6 +247,7 @@ dump_influxdb() {
 
 # Initializes the repo if needed, creates the backup archive, and prunes old archives
 run_borg_backup() {
+
     log "Starting Borg backup..."
 
     # Validate APP_PATHS_TO_EXCLUDE entries are absolute
@@ -260,15 +260,15 @@ run_borg_backup() {
     # Initialize repository if needed (with safety checks)
     if [ "$DRY_RUN" = false ] && [ ! -d "$BORG_REPO" ]; then
         log "Borg repository does not exist. Creating at $BORG_REPO..."
-        
+
         local repo_parent
         repo_parent=$(dirname -- "$BORG_REPO")
-        
+
         # Safety: disallow creating repo in system directories
         for forbidden in / /root /home /usr /etc /var; do
             [ "$repo_parent" = "$forbidden" ] && error_exit "Safety check failed: Attempting to create repository in a system directory: $BORG_REPO"
         done
-        
+
         # Explicitly check for the parent directory's existence.
         if [ ! -d "$repo_parent" ]; then
             log "Parent directory for repository does not exist. Attempting to create: $repo_parent"
@@ -282,7 +282,7 @@ run_borg_backup() {
         if [ ! -w "$repo_parent" ]; then
             error_exit "Parent directory is not writable: $repo_parent"
         fi
-        
+
         log "Initializing Borg repository at $BORG_REPO"
         # Export passphrase for init; unset ONLY on failure.
         if ! borg_run borg init --encryption=repokey-blake2 "$BORG_REPO"; then
@@ -298,7 +298,7 @@ run_borg_backup() {
 
     # Build command with resource limits if available
     local cmd_prefix=()
-    [ ${#RESOURCE_NICE_CMD[@]} -gt 0 ] && cmd_prefix=( "${RESOURCE_NICE_CMD[@]}" )
+    [ ${#RESOURCE_NICE_CMD[@]} -gt 0 ] && cmd_prefix=("${RESOURCE_NICE_CMD[@]}")
 
     # Build borg create command
     local borg_cmd=(
@@ -307,30 +307,30 @@ run_borg_backup() {
         --compression "$BORG_COMPRESSION"
     )
 
-    [ "$DEBUG" = true ] && borg_cmd+=( --debug )
+    [ "$DEBUG" = true ] && borg_cmd+=(--debug)
     # Use --progress for a better UI instead of --stats, which hides the spinner.
-    [ "$DRY_RUN" = false ] && borg_cmd+=( --progress )
-    [ "$DRY_RUN" = true ] && borg_cmd+=( --dry-run )
+    [ "$DRY_RUN" = false ] && borg_cmd+=(--progress)
+    [ "$DRY_RUN" = true ] && borg_cmd+=(--dry-run)
 
-    borg_cmd+=( "${BORG_EXCLUDES[@]}" )
+    borg_cmd+=("${BORG_EXCLUDES[@]}")
     for p in "${APP_PATHS_TO_EXCLUDE[@]}"; do
-        borg_cmd+=( --exclude="$p" )
+        borg_cmd+=(--exclude="$p")
     done
 
     # Exclusion Summary with Debug Logging
     local system_excludes_count=${#BORG_EXCLUDES[@]}
     local app_excludes_count=${#APP_PATHS_TO_EXCLUDE[@]}
     local total_excludes=$((system_excludes_count + app_excludes_count))
-    
+
     log "Exclusion summary: $total_excludes total excludes ($system_excludes_count system, $app_excludes_count application)"
-    
+
     # Debug logging for excludes
     if [ "$DEBUG" = true ]; then
         log_debug "System excludes (${system_excludes_count}):"
         for exclude in "${BORG_EXCLUDES[@]}"; do
             log_debug "  $exclude"
         done
-        
+
         log_debug "Application excludes (${app_excludes_count}):"
         for exclude in "${APP_PATHS_TO_EXCLUDE[@]}"; do
             log_debug "  $exclude"
@@ -338,9 +338,9 @@ run_borg_backup() {
     fi
 
     # Add archive name and paths to backup
-    borg_cmd+=( "$BORG_REPO::$ARCHIVE_NAME" )
-    borg_cmd+=( "${BACKUP_DIRS[@]}" )
-    
+    borg_cmd+=("$BORG_REPO::$ARCHIVE_NAME")
+    borg_cmd+=("${BACKUP_DIRS[@]}")
+
     # Add database dumps: package into a single tarball under STAGING_DIR to avoid exclude issues
     if [ "$DUMPS_CREATED" = true ] && [ -d "$DB_DUMP_DIR" ]; then
         # Create tarball path (global variable used by cleanup/verification)
@@ -355,33 +355,52 @@ run_borg_backup() {
         chmod 600 "$DB_DUMP_ARCHIVE" || true
 
         # Add the single tarball to the borg command (safer than adding the temp dir)
-        borg_cmd+=( "$DB_DUMP_ARCHIVE" )
+        borg_cmd+=("$DB_DUMP_ARCHIVE")
     fi
 
-    # Debug logging
-    log_debug "Full borg command: ${borg_cmd[*]}"
-    
     # Execute backup with passphrase in environment
-        # Run borg through borg_run so passphrase is supplied securely per-invocation.
-    if borg_run "${borg_cmd[@]}"; then
-        log "Borg create completed successfully."
+    local borg_output=""
+    local exit_code=0
+
+    # Simple approach: run borg and capture exit code, let output go to log via tee
+    log "Executing Borg backup (dry-run without stats)..."
+    if borg_output=$(borg_run "${borg_cmd[@]}" --stats 2>&1 | tee -a "$LOG_FILE"); then
+        exit_code=0
     else
-        local exit_code=$?
-        # Check for any WARNING exit code (1, or 100-127 for modern).
-        if [ "$exit_code" -eq 1 ] || { [ "$exit_code" -ge 100 ] && [ "$exit_code" -le 127 ]; }; then
-            log_warn "Borg create completed with warnings (exit code $exit_code). The backup archive is considered valid."
-        else
-            # Any other non-zero exit code is a FATAL ERROR.
-            error_exit "Borg create command failed with a fatal error (exit code $exit_code)."
+        exit_code=$?
+    fi
+
+    log "Borg command completed with exit code: $exit_code"
+
+    # Statistics extraction with dry-run handling
+    if [ "$DRY_RUN" = true ]; then
+        BORG_STATS="Dry-run mode: Statistics not available"
+    else
+        BORG_STATS=$(echo "$borg_output" | grep -A 8 -E "(This archive:|Archive size:|^[[:space:]]*Original size|^[[:space:]]*Deduplicated size)" | head -n 15 || echo "Statistics extraction failed")
+    fi
+
+    if [ "$exit_code" -eq 0 ]; then
+        log "Borg backup completed successfully."
+    elif [ "$exit_code" -eq 1 ]; then
+        log_warn "Borg backup completed with warnings. The archive is valid."
+        # Capture all lines containing warnings
+        BORG_WARNINGS=$(echo "$borg_output" | grep --color=never -i "warning" | head -n 10 || true)
+        # Also capture some context for the notification
+        if [ -f "$LOG_FILE" ] && [ -s "$LOG_FILE" ]; then
+            ERROR_CONTEXT=$(tail -n 10 "$LOG_FILE")
         fi
+        send_notification "warning" "Backup completed with warnings"
+        NOTIFICATION_SENT=true
+    else
+        error_exit "Borg backup failed with a fatal error (exit code $exit_code)." "$LINENO"
     fi
 
     # Prune old archives if requested
     if [ "$NO_PRUNE" = false ]; then
         if [ "$DRY_RUN" = false ]; then
             log "Pruning old archives..."
-            local prune_cmd=( "${cmd_prefix[@]}" borg prune -v --list "$BORG_REPO" --keep-daily="$RETENTION_DAYS" )
-            
+            local prune_cmd=("${cmd_prefix[@]}" borg prune -v --list "$BORG_REPO" --keep-daily="$RETENTION_DAYS")
+
             if borg_run "${prune_cmd[@]}"; then
                 log "Prune completed successfully."
             else
@@ -411,6 +430,5 @@ run_borg_repository_check() {
     if ! borg_run borg check --verify-data "$BORG_REPO"; then
         error_exit "CRITICAL: Borg repository integrity check failed!"
     fi
-    
-}
 
+}

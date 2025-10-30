@@ -20,7 +20,6 @@
 # The absolute path to your Borg repository.
 # This can be a local path or a remote one using SSH notation.
 # Example Local:  BORG_REPO="/mnt/backups/borg-repo"
-# Example Remote: BORG_REPO="user@server.com:/path/to/repo"
 BORG_REPO="/path/to/your/repo"
 
 # An absolute path to a temporary working directory.
@@ -31,13 +30,8 @@ STAGING_DIR="/var/tmp/borg-staging"
 
 # --- Backup Sources ---
 # An array of absolute paths on the host system to be backed up.
-# You can list multiple directories.
-# To back up the entire root filesystem, use: BACKUP_DIRS=("/")
-BACKUP_DIRS=(
-    "/etc"
-    "/home"
-    "/var/www"
-)
+# Designed for root backups. If root is not used, check and adapt _verify_spot_checks
+BACKUP_DIRS=("/")
 
 # --- Docker Integration ---
 # The absolute path to the docker-compose.yml file that defines your services.
@@ -84,6 +78,7 @@ DOCKER_COMPOSE_FILE="/path/to/your/docker-compose.yml"
 # --- Additional Exclusions ---
 # An array of extra absolute paths for Borg to exclude from the backup.
 # This is useful for excluding large, non-essential, or volatile directories.
+# Also exlcude the database paths, when you are performing database dumps
 # APP_PATHS_TO_EXCLUDE=()
 # Example:
 # APP_PATHS_TO_EXCLUDE=(
@@ -106,6 +101,9 @@ DOCKER_COMPOSE_FILE="/path/to/your/docker-compose.yml"
 
 # Your Discord webhook URL for success and failure notifications.
 # BACKUP_NOTIFY_DISCORD_WEBHOOK=""
+
+# Friendly server name which is used in your Discord notification
+#BACKUP_FRIENDLY_NAME=""
 
 
 # --- Advanced / Internal Settings ---
