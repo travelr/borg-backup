@@ -107,11 +107,20 @@ _secure_extract_one_file() {
         return 1
     fi
 
-    # 4. Move the verified file to its final destination.
+    # 4. Move the verified file to its final destination with safety checks.
     local extracted_file
     extracted_file=$(find "$secure_extract_dir" -type f -print -quit)
-    # The 'mv' command will write to /dev/null if that's the destination, which is fine.
-    mv "$extracted_file" "$destination_file"
+
+    # Defensive check: Refuse to overwrite any special device file (character, block, etc.)
+    if [ -e "$destination_file" ] && { [ -c "$destination_file" ] || [ -b "$destination_file" ]; }; then
+        log_error "  SAFETY: Refusing to overwrite a special device file ($destination_file) with a regular file."
+        # We still clean up the temp file.
+        rm -f -- "$extracted_file" 2>/dev/null || true
+        return 1
+    fi
+
+    # If all checks pass, move the file.
+    mv -- "$extracted_file" "$destination_file"
 
     return 0
 }
@@ -212,8 +221,8 @@ _verify_spot_checks() {
 
         # 1. Get the complete list of files and use grep for an exact, unambiguous match.
         if borg_run borg list "$archive_entry" --format '{path}{NL}' | grep -Fxq "$relative_path"; then
-            # The file exists. Now, 2. Attempt to extract it to confirm readability.
-            if ! _secure_extract_one_file "$archive_entry" "$relative_path" "/dev/null"; then
+            # The file exists. Now, 2. Attempt to extract its contents to /dev/null to confirm readability.
+            if ! borg_run borg extract --stdout "$archive_entry" "$relative_path" >/dev/null 2>&1; then
                 log_warn "Extraction FAILED for: $sample_file (as $relative_path)"
                 spot_failed=true
             else
@@ -269,7 +278,7 @@ check_backed_up_sqlite_integrity() {
     # --- END: New logic ---
 
     local temp_extract_dir
-    temp_extract_dir=$(mktemp -d "$STAGING_DIR/tmp_sqlite_XXXXXXXX")
+    temp_extract_dir=$(mktemp -d "$STAGING_DIR/tmp_sqlite_XXXXXXXX") || error_exit "Failed to create temporary directory for SQLite check"
     trap "rm -rf '$temp_extract_dir'" RETURN
 
     local sqlite_dbs
@@ -288,13 +297,16 @@ check_backed_up_sqlite_integrity() {
     while IFS= read -r db_path; do
         if [ -z "$db_path" ]; then continue; fi
         db_count=$((db_count + 1))
-        local safe_basename
-        safe_basename=$(basename "$db_path")
-        local temp_db_file="$temp_extract_dir/$safe_basename"
 
-        log "Checking: $db_path"
+        # Preserve path under temp dir to avoid collisions
+        safe_relpath="${db_path#/}"
+        temp_db_file="$temp_extract_dir/$safe_relpath"
+        mkdir -p "$(dirname "$temp_db_file")" || {
+            log_error "Failed to create temp dir"
+            check_failed=true
+            continue
+        }
 
-        # Extract the database file
         if ! borg_run borg extract "$BORG_REPO::$ARCHIVE_NAME" "$db_path" --stdout >"$temp_db_file"; then
             log_error "  ERROR: Failed to extract $db_path"
             check_failed=true

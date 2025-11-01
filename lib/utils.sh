@@ -261,14 +261,33 @@ borg_run() {
     unset BORG_PASSCOMMAND
 
     if command -v shred >/dev/null 2>&1; then
-        shred -u "$passfile" 2>/dev/null || rm -f "$passfile"
+        shred -u "$passfile"
     else
-        log "WARNING: 'shred' not found — secure deletion falling back to rm -f"
+        log_warn "'shred' not found. Falling back to 'rm' for passfile deletion."
         rm -f "$passfile"
+    fi
+
+    # CRITICAL SECURITY CHECK: Ensure the passfile was actually deleted.
+    if [ -e "$passfile" ]; then
+        # This is a serious condition. We should not continue.
+        error_exit "CRITICAL: Failed to delete temporary passphrase file: $passfile"
     fi
 
     return $rc
 }
+
+# Portable realpath helper
+portable_realpath() {
+    if command -v realpath >/dev/null 2>&1; then
+        realpath "$1"
+    elif command -v readlink >/dev/null 2>&1; then
+        readlink -f "$1" 2>/dev/null || echo ""
+    else
+        # Do not silently fall back to original — fail so caller can make a safe decision.
+        echo ""
+    fi
+}
+
 # Validates a given path, ensuring it is absolute and optionally within a specified base directory.
 # Resolves all symlinks and relative components to get the canonical path.
 # On success, echoes the resolved, canonical path. On failure, logs an error and returns 1.
@@ -281,13 +300,14 @@ validate_path() {
     local resolved_base=""
 
     # Resolve the allowed base first to ensure it's a valid path.
-    resolved_base=$(realpath -m "$allowed_base" 2>/dev/null) || {
+    resolved_base=$(portable_realpath "$allowed_base")
+    if [ -z "$resolved_base" ]; then
         log_error "Cannot resolve allowed base path: '$allowed_base'"
         return 1
-    }
+    fi
 
     # Resolve the user-provided path. -m allows non-existent paths to be resolved.
-    resolved_path=$(realpath -m "$path_to_validate" 2>/dev/null) || {
+    resolved_path=$(portable_realpath "$path_to_validate") || {
         log_error "Cannot resolve path: '$path_to_validate'"
         return 1
     }

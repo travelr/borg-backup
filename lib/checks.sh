@@ -49,7 +49,14 @@ validate_configuration() {
     # Validate absolute paths for critical directories/files
     local path_keys=("STAGING_DIR" "BORG_REPO" "DOCKER_COMPOSE_FILE" "SECRETS_FILE")
     for key in "${path_keys[@]}"; do
-        [[ "${!key}" != /* ]] && error_exit "Configuration key '$key' must be an absolute path"
+        local path_value="${!key}"
+        if [[ "$path_value" != /* ]]; then
+            error_exit "Configuration key '$key' must be an absolute path, but was: '$path_value'"
+        fi
+        # Add a new check to forbid using the root directory
+        if [[ "$path_value" == "/" ]]; then
+            error_exit "SAFETY: Using the root directory ('/') for '$key' is forbidden."
+        fi
     done
 
     # Verify that critical configuration files exist
@@ -72,6 +79,20 @@ validate_configuration() {
     if [ ! -w "$STAGING_DIR" ]; then
         error_exit "STAGING_DIR ($STAGING_DIR) is not writable by the running user"
     fi
+
+    log "Validating backup source directories..."
+    if [ ${#BACKUP_DIRS[@]} -eq 0 ]; then
+        error_exit "BACKUP_DIRS array is empty. Nothing to back up."
+    fi
+
+    for dir in "${BACKUP_DIRS[@]}"; do
+        if [ ! -d "$dir" ]; then
+            error_exit "Backup source directory specified in BACKUP_DIRS does not exist: $dir"
+        fi
+        if [ ! -r "$dir" ]; then
+            error_exit "Backup source directory specified in BACKUP_DIRS is not readable: $dir"
+        fi
+    done
 
 }
 

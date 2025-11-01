@@ -185,9 +185,13 @@ cleanup() {
     # --- CRITICAL: Always attempt to remove temporary dump files ---
     # This runs regardless of success/failure/DRY_RUN to prevent accumulation.
     if [ -n "${DB_DUMP_DIR:-}" ] && [ -d "$DB_DUMP_DIR" ]; then
-        log "Cleaning up temporary dump directory (on exit)..."
-        # Use '|| true' to ensure cleanup continues even if rm fails for some reason
-        rm -rf "$DB_DUMP_DIR" || log_warn "Failed to remove temporary dump directory: $DB_DUMP_DIR"
+        # CRITICAL SAFETY CHECK: Ensure the path is within the staging directory before deleting.
+        if [[ "$DB_DUMP_DIR" == "$STAGING_DIR"* ]] && [[ "$DB_DUMP_DIR" != "$STAGING_DIR" ]]; then
+            log "Cleaning up temporary dump directory (on exit)..."
+            rm -rf "$DB_DUMP_DIR" || log_warn "Failed to remove temporary dump directory: $DB_DUMP_DIR"
+        else
+            log_error "SAFETY HALT: Refusing to delete potentially unsafe path: $DB_DUMP_DIR"
+        fi
     fi
 
     # Remove the per-run DB tarball (from STAGING_DIR) if it exists.
@@ -223,29 +227,42 @@ on_exit() {
     unset BORG_PASSPHRASE
     rm -f /tmp/borg-pass.* 2>/dev/null || true
 
-    # Only remove lock file if we are the owner
+    # If the lock file exists and claims our PID, release it and remove it.
     if [ -f "$LOCK_FILE" ]; then
-        lock_pid=$(cat "$LOCK_FILE" 2>/dev/null || echo "")
+        # Read owner PID safely
+        lock_pid="unknown"
+        if [ -r "$LOCK_FILE" ]; then
+            read -r lock_pid <"$LOCK_FILE" || lock_pid="unknown"
+        fi
+
         if [ "$lock_pid" = "$$" ]; then
-            rm -f "$LOCK_FILE" 2>/dev/null || true
+            log "Lock file ($LOCK_FILE) owned by this PID; releasing lock and removing file."
+
+            # Close FD 200 to release the flock if open. Ignore errors.
+            exec 200>&- 2>/dev/null || true
+
+            # Remove the lock file; if unlink fails, log and continue.
+            if rm -f "$LOCK_FILE" 2>/dev/null; then
+                log "Removed lock file $LOCK_FILE"
+            else
+                log_warn "Could not remove lock file $LOCK_FILE; it may have been removed already or permission denied."
+            fi
         else
-            log "Not removing lock file ($LOCK_FILE) — owned by PID $lock_pid"
+            log "Not removing lock file ($LOCK_FILE) — owned by PID ${lock_pid:-unknown}"
         fi
     fi
-
-    # close fd 200 if open
-    exec 200>&- 2>/dev/null || true
 
     # On failure (non-zero exit code), attempt an emergency restart of services
     if [ "$exit_code" -ne 0 ]; then
         local any_stopped=false
-        # Get a list of currently running services just once.
         local running_services
-        running_services=$(docker_compose_cmd ps --services --filter "status=running")
 
-        # Check each service that this script was supposed to have stopped.
+        # Wrap docker_compose_cmd in +e to avoid trap-recursion on unexpected failures
+        set +e
+        running_services=$({ docker_compose_cmd ps --services --filter "status=running"; } 2>/dev/null) || running_services=""
+        set -e
+
         for svc in "${STOPPED_BY_SCRIPT[@]}"; do
-            # If the service is NOT in the list of running services, we need to restart.
             if ! echo "$running_services" | grep -Fxq "$svc"; then
                 any_stopped=true
                 break
@@ -253,14 +270,19 @@ on_exit() {
         done
 
         if [ "$any_stopped" = "true" ]; then
-            log "Recovery: Found stopped services, attempting to restart them due to script exit (code: $exit_code)..."
-            set +e # Prevent trap from exiting if restart fails
-            (manage_services "start")
+            log "Recovery: Attempting to restart managed services due to script exit (code: $exit_code)..."
+            set +e
+            if ! manage_services "start"; then
+                # Don't call error_exit here (would re-enter trap). Log instead so operator sees it.
+                log_error "EMERGENCY: Failed to restart managed services after script failure!"
+            fi
             set -e
         fi
     fi
 
+    # Final cleanup (cleanup() may consult EXIT_CODE_GLOBAL)
     cleanup
+
     log "Exited with status $exit_code."
 }
 
@@ -325,7 +347,9 @@ main() {
         elif [ -z "${ARCHIVE_NAME:-}" ]; then
             log "No archive specified, using the latest archive"
             # Retrieve the latest archive name, explicitly remove trailing whitespace
-            ARCHIVE_NAME=$(borg_run borg list "$BORG_REPO" --last 1 --format '{name}' 2>/dev/null | head -n1 | tr -d '\n\r' || true)
+            ARCHIVE_NAME=$(borg_run borg list "$BORG_REPO" --last 1 --format '{name}{NL}' 2>/dev/null | head -n1)
+            # Safely strip a single trailing newline, if present
+            ARCHIVE_NAME="${ARCHIVE_NAME%$'\n'}"
             if [ -z "$ARCHIVE_NAME" ]; then
                 error_exit "No archives found in repository"
             fi
@@ -405,30 +429,23 @@ main() {
 LOCK_FILE_DIR=$(dirname "$LOCK_FILE")
 mkdir -p "$LOCK_FILE_DIR" || error_exit "Failed to create lock file directory $LOCK_FILE_DIR"
 
-# Open the lock file descriptor (create if missing)
-exec 200>"$LOCK_FILE" || error_exit "Failed to open lock file $LOCK_FILE"
-
-# Try to get the lock non-blocking
-if ! flock -n 200; then
-    # Read the PID from the lock file. A simple cat is sufficient.
-    existing_pid=$(cat "$LOCK_FILE" 2>/dev/null || echo "unknown")
-
+# open FD 200 and acquire flock
+exec 200>"$LOCK_FILE" || error_exit "Failed to open lock file: $LOCK_FILE"
+if ! flock -w 5 200; then
+    existing_pid="unknown"
+    if [ -r "$LOCK_FILE" ]; then
+        read -r existing_pid <"$LOCK_FILE" || existing_pid="unknown"
+    fi
     if check_lock_pid "$existing_pid"; then
-        log "FATAL: Another backup instance is already running (PID $existing_pid). Exiting."
-        exit 1
+        error_exit "Another backup instance is already running (PID $existing_pid). Exiting."
     else
-        log "Stale lock detected (PID: $existing_pid). Attempting takeover..."
-        rm -f "$LOCK_FILE" 2>/dev/null || true
-        exec 200>"$LOCK_FILE" || error_exit "Failed to open lock file for takeover"
-        if ! flock -n 200; then
-            error_exit "Failed to acquire lock after stale lock removal; another process likely acquired it."
-        fi
+        error_exit "Could not acquire lock after timeout; stale-PID check inconclusive (found: $existing_pid). Please investigate."
     fi
 fi
 
-# We hold the flock on fd 200 — ensure file content is clean then write our PID
-: >"$LOCK_FILE" 2>/dev/null || true
-printf "%s\n" "$$" >&200 || error_exit "Failed to write PID to lock file"
+# record PID for diagnostics
+: >&200
+printf "%s\n" "$$" >&200
 chmod 600 "$LOCK_FILE" 2>/dev/null || true
 
 # Set the EXIT trap BEFORE calling main to ensure cleanup happens on any exit.

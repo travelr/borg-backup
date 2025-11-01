@@ -77,18 +77,6 @@ run_database_dumps() {
     log "Database dumps complete."
 }
 
-# Portable realpath helper
-portable_realpath() {
-    if command -v realpath >/dev/null 2>&1; then
-        realpath "$1"
-    elif command -v readlink >/dev/null 2>&1; then
-        readlink -f "$1" 2>/dev/null || echo ""
-    else
-        # Do not silently fall back to original — fail so caller can make a safe decision.
-        echo ""
-    fi
-}
-
 # Validates that the directory for a dump file is securely located within the main DB_DUMP_DIR.
 validate_dump_path() {
     local output_file="$1"
@@ -116,6 +104,13 @@ validate_dump_path() {
 # Helper function to get a password for a specific container. No fallbacks.
 get_password_value() {
     local container_name="$1"
+
+    # Guard against invalid or malicious container names
+    if [[ -z "$container_name" || ! "$container_name" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+        log_error "Invalid container name provided: '$container_name'" >&2
+        echo ""
+        return
+    fi
 
     # Sanitize container name...
     local safe_name="${container_name//-/_}"
@@ -153,9 +148,8 @@ dump_mysql() {
 
     # Create a secure, temporary script to hold the dump command with the password.
     local temp_script
-    temp_script=$(mktemp) || error_exit "Failed to create temporary script for MySQL dump"
-    # Ensure the script is always removed when the function returns.
-    trap "rm -f '$temp_script'" RETURN
+    temp_script=$(mktemp "$STAGING_DIR/tmp_mysql_script.XXXXXX") || error_exit "Failed to create temporary script in $STAGING_DIR"
+    cleanup_temp_script() { rm -f -- "$temp_script" 2>/dev/null || true; }
     chmod 600 "$temp_script"
 
     # Write the command to the script. The --password flag is used directly.
@@ -166,10 +160,11 @@ dump_mysql() {
     log_debug "Executing secure MySQL/MariaDB dump via stdin pipe..."
     # Pipe the script into the container's shell. The password is never exposed on the host.
     if ! "${RESOURCE_NICE_CMD[@]}" docker exec -i "$container_id" sh <"$temp_script" | gzip >"$output_file"; then
+        cleanup_temp_script
         error_exit "MySQL/MariaDB dump failed for container $container_id"
     fi
 
-    # The trap will handle the final rm -f.
+    cleanup_temp_script
     return 0
 }
 
@@ -184,9 +179,8 @@ dump_postgres() {
 
     # Create a secure, temporary script.
     local temp_script
-    temp_script=$(mktemp) || error_exit "Failed to create temporary script for PostgreSQL dump"
-    # Ensure the script is always removed when the function returns.
-    trap "rm -f '$temp_script'" RETURN
+    temp_script=$(mktemp "$STAGING_DIR/tmp_postgres_script.XXXXXX") || error_exit "Failed to create temporary script in $STAGING_DIR"
+    cleanup_temp_script() { rm -f -- "$temp_script" 2>/dev/null || true; }
     chmod 600 "$temp_script"
 
     # Write the command to the script. PGPASSWORD is set only for the scope of the 'exec' command
@@ -197,10 +191,11 @@ dump_postgres() {
     log_debug "Executing secure PostgreSQL dump via stdin pipe..."
     # Pipe the script into the container's shell.
     if ! "${RESOURCE_NICE_CMD[@]}" docker exec -i "$container_id" sh <"$temp_script" | gzip >"$output_file"; then
+        cleanup_temp_script
         error_exit "PostgreSQL dump failed for container $container_id"
     fi
 
-    # The trap will handle the final rm -f.
+    cleanup_temp_script
     return 0
 }
 
@@ -223,7 +218,7 @@ dump_influxdb() {
     fi
 
     local temp_dir
-    temp_dir=$(mktemp -d) || error_exit "Failed to create temporary directory for InfluxDB backup"
+    temp_dir=$(mktemp -d "$STAGING_DIR/tmp_influxdb_extract.XXXXXX") || error_exit "Failed to create temporary directory for InfluxDB backup"
 
     # Also suppress the output of the docker cp command for a cleaner log.
     if ! docker cp "$container_id:$temp_backup_dir/." "$temp_dir/" >/dev/null 2>&1; then
